@@ -1,0 +1,309 @@
+# Standalone product composition: no dsh-base or standard preset is loaded.
+- insert:
+    - id: timer
+      name: '@deepseek-ai/cordis-plugin-timer'
+    - id: studio-network
+      name: '@harnessstudio/studio/network'
+    - id: llm
+      name: '@deepseek-ai/dsh-llm'
+    - id: llm-deepseek
+      name: '@deepseek-ai/dsh-llm-deepseek-api-key'
+    - id: llm-configurable
+      name: '@deepseek-ai/dsh-llm-pi-ai'
+      config:
+        providers: {}
+    - id: config-editor
+      name: '@deepseek-ai/dsh-config-editor'
+    - id: settings
+      name: '@deepseek-ai/dsh-settings'
+    - id: llm-retry
+      name: '@deepseek-ai/dsh-llm-retry'
+    - id: session
+      name: '@deepseek-ai/dsh-session'
+    - id: session-log-deepseek
+      name: '@deepseek-ai/dsh-session-log-deepseek'
+    - id: deepseek-llm-api-extensions
+      name: '@deepseek-ai/dsh-deepseek-llm-api-extensions'
+    - id: session-projection
+      name: '@deepseek-ai/dsh-session-projection'
+    - id: user-questions
+      name: '@deepseek-ai/dsh-user-questions'
+    - id: attachments
+      name: '@deepseek-ai/dsh-attachment-local'
+      config:
+        dshHome: !!js dshHomePath()
+        maxImageBytes: 10485760
+        maxImagesPerMessage: 6
+        maxMessageImageBytes: 20971520
+        maxImagePixels: 40000000
+        maxImageDimension: 12000
+        normalizedImageMaxDimension: 2048
+        normalizedImageMaxPixels: 4194304
+    - id: session-persistence
+      name: '@deepseek-ai/dsh-session-persistence-jsonl'
+      config:
+        root: !!js dshHomePath('studio/sessions')
+        compression: none
+    - id: agent
+      name: '@deepseek-ai/dsh-agent'
+    - id: tools
+      name: '@deepseek-ai/dsh-tools'
+      config:
+        mode: native
+    - id: tool-ask-user
+      name: '@deepseek-ai/dsh-tool-ask-user'
+      config:
+        mode: timed
+        timeout: -1
+    - id: system-prompt
+      name: '@deepseek-ai/dsh-system-prompt'
+      config:
+        includeHarnessIdentity: false
+        includeRuntimeContext: false
+        personaPrefix: ''
+    - id: token-meter
+      name: '@deepseek-ai/dsh-token-meter'
+    - id: web
+      name: '@deepseek-ai/dsh-web'
+      config:
+        searchProvider: deepseek-official
+        fetchProvider: studio-http
+    - id: web-search-deepseek
+      name: '@deepseek-ai/dsh-web-search-deepseek'
+    - id: studio-web-fetch
+      name: '@harnessstudio/studio/web-fetch'
+      config:
+        timeoutMs: 45000
+        maxBodyChars: 100000
+        maxResponseBytes: 20971520
+        maxPdfPages: 80
+        pdfTimeoutMs: 15000
+        browserFallback: true
+        browserTimeoutMs: 20000
+    - id: tool-web
+      name: '@deepseek-ai/dsh-tool-web'
+      config:
+        searchMaxQueries: 4
+        searchMaxResults: 8
+        searchTimeoutMs: 60000
+        fetchTimeoutMs: 60000
+        fetchMaxOutputChars: 200000
+    - id: tool-call-timeout
+      name: '@deepseek-ai/dsh-tool-call-timeout-policy'
+    - id: agent-loop
+      name: '@deepseek-ai/dsh-agent-loop'
+      config:
+        agents: []
+    - id: agent-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        default: studio
+    - id: preset-studio
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: studio
+        name: HarnessStudio
+        description: Industrial task tools with a restricted workspace.
+        plugins:
+          # One tool result enters the context up to ~8000 estimated tokens (~32,000 characters); the rest stays in a
+          # temporary file. Each preset mounts its own copy: two copies on one Agent would cut a result twice.
+          - id: spill-policy
+            name: '@deepseek-ai/dsh-spill-policy'
+            config:
+              maxInlineTokens: 8000
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+    # Autonomy-run conversations: the studio preset plus the advisory repeat-call reminder (a session keeps its preset).
+    - id: preset-studio-autonomy
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: studio-autonomy
+        name: HarnessStudio autonomy
+        description: Industrial task tools for autonomy-run conversations, with the repeat-call reminder.
+        plugins:
+          # A worker reads many pages in one long turn: ~2000 estimated tokens (~8000 characters) of each result stay
+          # in its context, the full text in a temporary file it can search and read in parts.
+          - id: spill-policy
+            name: '@deepseek-ai/dsh-spill-policy'
+            config:
+              maxInlineTokens: 2000
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              # The basic engine with pressure at about 120,000 tokens on large windows (autonomy-compaction.ts).
+              - id: compaction-basic
+                name: '@harnessstudio/studio/autonomy-compaction'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+          - id: repeat-tool-reminder
+            name: '@deepseek-ai/dsh-repeat-tool-reminder'
+            config:
+              # Waiting and status polling repeat the same call on purpose.
+              exclude: [studio_autonomy_wait, studio_autonomy_status, studio_software_status, studio_vm_job_status]
+    # Autonomy goals: the backend creates one on the orchestrator; the driver continues it whenever the orchestrator is idle.
+    - id: goal
+      name: '@deepseek-ai/dsh-goal'
+      config:
+        defaultMaxGoalRounds: 200
+    - id: tool-goal
+      name: '@deepseek-ai/dsh-tool-goal'
+    - id: goal-round-driver
+      name: '@deepseek-ai/dsh-goal-round-driver'
+    - id: credentials
+      name: '@deepseek-ai/dsh-credentials-local'
+      config:
+        watch: false
+    - id: web-startup
+      name: '@deepseek-ai/dsh-web-app/startup'
+    - id: webserver
+      name: '@deepseek-ai/dsh-host-webserver'
+      inject: [webStartup]
+      config:
+        host: !!js ctx.webStartup.host ?? '127.0.0.1'
+        port: !!js ctx.webStartup.port ?? 3080
+    - id: web-runtime
+      name: '@deepseek-ai/dsh-web-app'
+      inject: [webStartup]
+      config:
+        openBrowser: !!js ctx.webStartup.openBrowser
+        printUrl: true
+        surfaceContext: false
+        trustedHosts: !!js ctx.webStartup.trustedHosts
+    - id: connection
+      name: '@deepseek-ai/dsh-client-connection'
+      inject: [webRuntime]
+      config:
+        trustedHosts: !!js ctx.webRuntime.trustedHosts
+        maxRequestBodyBytes: 33554432
+    - id: studio-browser-access
+      name: '@harnessstudio/studio/browser-access'
+      config:
+        mode: anonymous
+    - id: modules
+      name: '@deepseek-ai/dsh-client-modules'
+    - id: ui-renderer
+      name: '@deepseek-ai/dsh-client-ui-renderer'
+    - id: studio
+      name: '@harnessstudio/studio'
+      config:
+        dataRoot: !!js dshHomePath('studio')
+        promptPath: !!js process.env.STUDIO_ROOT + '/prompts/engineering-system-prompt.md'
+        projectPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/project-system-prompt.md'
+        projectLiveContextPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/project-live-context-system-prompt.md'
+        taskLiveContextSingleUserPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/task-live-context-single-user-system-prompt.md'
+        taskLiveContextReviewedPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/task-live-context-reviewed-system-prompt.md'
+        projectChatTempPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/project-chat-temp-system-prompt.md'
+        taskChatTempPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/task-chat-temp-system-prompt.md'
+        pdfRendererPath: !!js process.env.STUDIO_PDF_RENDERER_PATH || 'pdftoppm'
+        workspaceIds: []
+        maxFileBytes: 262144
+    - id: studio-audit
+      name: '@harnessstudio/studio/chat-audit'
+      config:
+        dataRoot: !!js dshHomePath('studio')
+        maxBodyBytes: 134217728
+    - id: studio-domain
+      name: '@harnessstudio/studio/domain'
+      config:
+        dataRoot: !!js dshHomePath('studio')
+        workflowMode: !!js process.env.STUDIO_WORKFLOW_MODE || 'single-user'
+        legacyWorkspaceIds: []
+        maxFileBytes: 262144
+        # The same STUDIO_SEAT_BACKEND as studio-software-seat (it refuses to start on a mismatch). none: task and project
+        # files in <studio data>/files/<projectId>/{tasks/<taskId>,shared}, managed by Studio alone.
+        softwareBackend: !!js process.env.STUDIO_SEAT_BACKEND || 'mock'
+        # vm-manager backend: task files are vm_manager task spaces (D:), project files its shared folder (F:).
+        vmProjectsRoot: !!js (process.env.STUDIO_SEAT_BACKEND === 'vm-manager' && process.env.STUDIO_VMM_PROJECTS_ROOT) || ''
+        vmEndpoint: !!js process.env.STUDIO_VMM_URL || ''
+        vmTrustedHttpOrigins: !!js (process.env.STUDIO_VMM_TRUSTED_HTTP_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean)
+    - id: studio-software-seat
+      name: '@harnessstudio/studio/seat'
+      config:
+        dataRoot: !!js dshHomePath('studio')
+        endpoint: !!js process.env.STUDIO_SEAT_URL || ''
+        token: !!js process.env.STUDIO_SEAT_TOKEN || ''
+        promptPath: !!js process.env.STUDIO_ROOT + '/prompts/software-bridge-system-prompt.md'
+        timeoutMs: 10000
+        # mock (default), vm-manager, or none (no software: no Mock, no VMs, no software tools); STUDIO_VMM_URL is the vm_manager origin.
+        backend: !!js process.env.STUDIO_SEAT_BACKEND || 'mock'
+        vmEndpoint: !!js process.env.STUDIO_VMM_URL || ''
+        vmTrustedHttpOrigins: !!js (process.env.STUDIO_VMM_TRUSTED_HTTP_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean)
+        vmPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/software-vm-system-prompt.md'
+        noSoftwarePromptPath: !!js process.env.STUDIO_ROOT + '/prompts/software-none-system-prompt.md'
+    - id: studio-model-settings
+      name: '@harnessstudio/studio/models'
+      config:
+        defaultProvider: ''
+        defaultModel: ''
+    - id: studio-web
+      name: '@harnessstudio/studio/web'
+    - id: studio-graph-planning
+      name: '@harnessstudio/studio/planning'
+      config:
+        promptPath: !!js process.env.STUDIO_ROOT + '/prompts/graph-planning-system-prompt.md'
+        maxPatchChars: 65536
+    - id: studio-planning-questions
+      name: '@harnessstudio/studio/questions'
+    - id: studio-task-checklist
+      name: '@harnessstudio/studio/todo'
+      config:
+        promptPath: !!js process.env.STUDIO_ROOT + '/prompts/task-checklist-system-prompt.md'
+        maxChecklistChars: 262144
+    - id: studio-ui
+      name: '@harnessstudio/ui'
+    - id: studio-engineering-context
+      name: '@harnessstudio/studio/engineering-context'
+      config:
+        promptPath: !!js process.env.STUDIO_ROOT + '/prompts/engineering-context-system-prompt.md'
+    # Agent Linux sandbox: sandbox_manager (deploy/compose.sandbox.yml) starts one container per conversation.
+    - id: studio-sandbox
+      name: '@harnessstudio/studio/sandbox'
+      config:
+        endpoint: !!js process.env.STUDIO_SANDBOX_URL || ''
+        tokenFile: !!js process.env.STUDIO_SANDBOX_TOKEN_FILE || ''
+        promptPath: !!js process.env.STUDIO_ROOT + '/prompts/sandbox-system-prompt.md'
+        noSoftwarePromptPath: !!js process.env.STUDIO_ROOT + '/prompts/sandbox-no-software-system-prompt.md'
+        dataRoot: !!js dshHomePath('studio')
+    # Autonomy runs: orchestrator and worker conversations, run control, budgets and /api/studio/autonomy/*.
+    - id: studio-autonomy
+      name: '@harnessstudio/studio/autonomy'
+      config:
+        dataRoot: !!js dshHomePath('studio')
+        orchestratorPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/autonomy-orchestrator-system-prompt.md'
+        workerPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/autonomy-worker-system-prompt.md'
+        orchestratorNoSoftwarePromptPath: !!js process.env.STUDIO_ROOT + '/prompts/autonomy-orchestrator-no-software-system-prompt.md'
+        workerNoSoftwarePromptPath: !!js process.env.STUDIO_ROOT + '/prompts/autonomy-worker-no-software-system-prompt.md'
+    # Skills: the native registry and `skill` tool, fed by Studio's global library and each project's F:\skills.
+    - id: skill-registry
+      name: '@deepseek-ai/dsh-skill'
+    - id: tool-skill
+      name: '@deepseek-ai/dsh-tool-skill'
+    - id: studio-skills
+      name: '@harnessstudio/studio/skills'
+      config:
+        dataRoot: !!js dshHomePath('studio')
+    # MCP: servers added on the MCP page are mounted at runtime as native mcp-client instances.
+    - id: mcp-resources
+      name: '@deepseek-ai/dsh-mcp-resources'
+    - id: studio-mcp
+      name: '@harnessstudio/studio/mcp'
+      config:
+        dataRoot: !!js dshHomePath('studio')
+    # Plugins: Claude Code-format folders bundling skills and HTTP MCP servers, installed once for every project.
+    - id: studio-plugins
+      name: '@harnessstudio/studio/plugins'
+      config:
+        dataRoot: !!js dshHomePath('studio')

@@ -1,0 +1,5 @@
+# Test instances only (HS_SMOKE=1): load the deterministic smoke model (config/smoke.patch.yml). Not for users.
+services:
+  studio:
+    environment:
+      STUDIO_SMOKE: '1'

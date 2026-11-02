@@ -1,0 +1,56 @@
+# Studio as deployed by bin/harnessstudio. The command picks the overlays in this folder from its configuration
+# (.studio/deploy/harnessstudio.env) and sets every HS_* variable below; nothing here belongs to one machine.
+# See docs/deploy-cli.md. The older deploy/compose*.yml files stay for hand-written commands.
+#
+# Service, network and volume names match the older files, so the command adopts a deployment made with them
+# (compose project harnessstudio, volume harnessstudio_studio-data) without moving any data.
+name: harnessstudio
+services:
+  studio:
+    image: harnessstudio/studio:${HS_TAG:?HS_TAG is set by bin/harnessstudio}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    # Bootstrap prepares mounts and drops UID. KILL lets root init forward signals
+    # to that UID; setuid clears capabilities in the service process itself.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    networks: [studio]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    ports:
+      - '${HS_BIND:?}:${HS_PORT:?}:3080'
+    labels:
+      # Settings this container was created with; bin/harnessstudio asks before replacing it when they change.
+      org.harnessstudio.config: ${HS_CONFIG_DIGEST:?}
+    environment:
+      # The container entrypoint always wants a Seat URL and token. Only the Mock backend (development) uses them,
+      # so the Mock Seat service itself is not part of this deployment.
+      STUDIO_SEAT_URL: http://mock-seat:8080
+      STUDIO_SEAT_TOKEN_FILE: /run/secrets/mock_seat_token
+      STUDIO_PROVIDER_ENV_FILE: /run/secrets/provider_env
+      STUDIO_PUBLIC_URL: http://${HS_PUBLIC_HOST:?}:${HS_PORT}/
+      STUDIO_TRUSTED_HOSTS: ${HS_PUBLIC_HOST}:${HS_PORT}
+      # Without vm_manager: no software at all (vm-manager.yml switches it on).
+      STUDIO_SEAT_BACKEND: none
+      NO_PROXY: localhost,127.0.0.1,::1,mock-seat,sandbox-manager
+    secrets: [mock_seat_token, provider_env]
+    volumes:
+      - studio-data:/var/lib/harnessstudio
+secrets:
+  mock_seat_token:
+    file: ${HS_SECRETS_DIR:?}/mock-seat-token
+  provider_env:
+    file: ${HS_SECRETS_DIR}/provider.env
+volumes:
+  studio-data:
+networks:
+  studio:

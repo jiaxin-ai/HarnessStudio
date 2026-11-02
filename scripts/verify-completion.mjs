@@ -1,0 +1,253 @@
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile, symlink } from 'node:fs/promises';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { root } from './prepare.mjs';
+import { startApp, stopApp, finishedChat } from './verify-app.mjs';
+import { emptyChatState, foldChatPacket, conversationRows } from '../plugins/ui/lib/chat-state.js';
+
+// Isolated, disposable data; never changes the user's current preview projects.
+await mkdir(join(root, '.studio'), { recursive: true });
+const home = await mkdtemp(join(root, '.studio/completion-http-test-'));
+let app;
+try {
+  app = await startApp(home);
+  const project = await app.json('projects', { title: '完成确认 HTTP 验证' });
+  const task = await app.json('task/quick', { projectId: project.id, title: '检查受控报告' });
+  const metadata = await app.json('task/metadata', { id: task.id, revision: task.revision, title: task.title, goal: '确认报告包含测试标记', checklist: [{ text: '受控报告内容已逐项检查' }] });
+  assert.equal(metadata.checklist.length, 1); assert.equal(metadata.canEditMetadata, true);
+  assert.equal((await app.call('task/metadata', { id: task.id, revision: task.revision, title: task.title, goal: '', checklist: [] })).status, 400, 'Stale metadata updates must be rejected');
+  assert.equal((await app.call('task/metadata', { id: task.id, revision: metadata.revision, title: '', goal: '', checklist: [] })).status, 400, 'Names must stay nonempty after creation');
+  const firstReport = '完成确认：受控测试数据', updatedReport = '重新提交：受控报告第二版', details = '累计提交区保留的附录';
+  await app.json('file', { taskId: task.id, path: 'report.md', content: firstReport });
+  await app.json('file', { taskId: task.id, path: 'draft.md', content: '未提交的受控草稿' });
+  assert.equal((await app.json(`task?id=${task.id}`)).state, 'unstarted', 'Saving files must not require Start or change the state');
+  const preview = () => app.json(`task/completion?taskId=${task.id}`);
+  const args = value => ({ taskId: value.taskId, revision: value.taskRevision, workspaceVersion: value.workspaceVersion, childrenVersion: value.childrenVersion,
+    checkedGoalIds: value.goals.filter(goal => !goal.system).map(goal => goal.id), submissionId: value.submittedFiles?.id });
+  const submit = (value, files = [{ path: 'report.md', description: '  已人工核对的正式报告  ' }]) => app.json('task/completion/files', { taskId: task.id, revision: value.taskRevision, workspaceVersion: value.workspaceVersion, files });
+  const submittedPath = (receipt, path) => join(home, 'studio', 'file-submissions', task.id, receipt.id, 'files', path);
+  const snapshotRead = (snapshotId, path) => app.json(`snapshot/file?${new URLSearchParams({ taskId: task.id, snapshotId, path })}`);
+  const first = await preview();
+  assert.deepEqual(first.files.map(file => file.path), ['draft.md', 'report.md']);
+  assert.ok(first.files.every(file => Number.isFinite(Date.parse(file.createdAt)) && Number.isFinite(Date.parse(file.modifiedAt))));
+  assert.equal(first.goals.length, 3); assert.equal(first.goals.find(goal => goal.system).checked, false);
+  assert.deepEqual(first.blockers, []);
+  const read = await app.json(`project/file?${new URLSearchParams({ projectId: project.id, taskId: task.id, path: 'report.md' })}`);
+  assert.equal(read.status, 'text'); assert.match(read.content, /受控测试数据/);
+  assert.equal((await app.call('task/completion', args(first))).status, 400, 'A current annotated submission is required');
+  assert.equal((await app.call('task/completion/files', { taskId: task.id, revision: first.taskRevision, workspaceVersion: first.workspaceVersion, files: [{ path: 'report.md', description: ' ' }] })).status, 400, 'Every selected file requires a nonempty description');
+  const submitted = await submit(first); assert.equal(submitted.goals.find(goal => goal.system).checked, true);
+  assert.equal(submitted.submittedFiles.storageVersion, 1, 'A successful submission must have independently persisted file bytes');
+  assert.equal(submitted.submittedFiles.files[0].description, '已人工核对的正式报告');
+  assert.equal(await readFile(submittedPath(submitted.submittedFiles, 'report.md'), 'utf8'), firstReport, 'Submission must capture the file before task completion');
+  assert.equal((await stat(submittedPath(submitted.submittedFiles, 'report.md'))).mode & 0o222, 0, 'Submitted file bytes must be read-only');
+  assert.equal((await app.call('task/completion', { ...args(submitted), checkedGoalIds: [first.goals[0].id] })).status, 400, 'Incomplete checklist must be rejected');
+  assert.equal((await app.call('task/completion', { ...args(submitted), checkedGoalIds: submitted.goals.map(goal => goal.id) })).status, 400, 'A system checkbox cannot be acknowledged by clients');
+  await stopApp(app.child); app = await startApp(home);
+  assert.deepEqual((await preview()).submittedFiles, submitted.submittedFiles, 'Committed file bytes and descriptions must survive restart');
+  await app.json('file', { taskId: task.id, path: 'draft.md', content: '未提交的草稿已修改' });
+  assert.deepEqual((await preview()).submittedFiles, submitted.submittedFiles, 'Unselected workspace changes must preserve the committed files');
+  assert.equal((await app.call('task/completion', args(submitted))).status, 400, 'Changed files must require a new preview');
+  await app.json('file', { taskId: task.id, path: 'details.md', content: details });
+  const secondSubmission = await submit(await preview(), [{ path: 'details.md', description: '人工核对的附录' }]);
+  assert.notEqual(secondSubmission.submittedFiles.id, submitted.submittedFiles.id);
+  assert.deepEqual(secondSubmission.submittedFiles.files.map(file => file.path).sort(), ['details.md', 'report.md'], 'Submitting a second batch must accumulate prior paths');
+  assert.equal(await readFile(submittedPath(secondSubmission.submittedFiles, 'report.md'), 'utf8'), firstReport);
+  await app.json('file', { taskId: task.id, path: 'report.md', content: updatedReport });
+  assert.deepEqual((await preview()).submittedFiles, secondSubmission.submittedFiles, 'Editing a submitted workspace file must not alter the committed version');
+  const updatedSubmission = await submit(await preview(), [{ path: 'report.md', description: '人工核对的第二版报告' }]);
+  assert.deepEqual(updatedSubmission.submittedFiles.files.map(file => file.path).sort(), ['details.md', 'report.md'], 'Resubmitting one path must preserve other committed files');
+  assert.notEqual(updatedSubmission.submittedFiles.files.find(file => file.path === 'report.md').version, submitted.submittedFiles.files[0].version);
+  assert.equal(await readFile(submittedPath(updatedSubmission.submittedFiles, 'report.md'), 'utf8'), updatedReport);
+  assert.equal(await readFile(submittedPath(updatedSubmission.submittedFiles, 'details.md'), 'utf8'), details);
+  assert.equal(await readFile(submittedPath(submitted.submittedFiles, 'report.md'), 'utf8'), firstReport, 'Later batches must not overwrite an earlier immutable submission');
+  const currentMetadata = await app.json(`task?id=${task.id}`);
+  await app.json('task/metadata', { id: task.id, revision: currentMetadata.revision, title: task.title, goal: '确认完整报告包含测试标记', checklist: currentMetadata.checklist });
+  assert.equal((await app.call('task/completion', args(updatedSubmission))).status, 400, 'Metadata edits invalidate the completion preview');
+  const afterMetadata = await preview();
+  assert.deepEqual(afterMetadata.submittedFiles, updatedSubmission.submittedFiles, 'Metadata edits must preserve the committed files');
+  await app.json('file', { taskId: task.id, path: 'report.md', content: '提交后未重新提交的工作副本' });
+  assert.equal((await app.call('task/completion', args(afterMetadata))).status, 400, 'Committed files must not allow a stale workspace preview to complete');
+  const current = await preview(), response = await app.json('task/completion', args(current));
+  assert.equal(response.task.state, 'completed'); assert.equal(response.task.canEditMetadata, false);
+  const { snapshot } = await app.json(`snapshot?taskId=${task.id}`);
+  assert.deepEqual(snapshot.measurements, [], 'Manual acknowledgements must not invent measured evidence');
+  assert.deepEqual(snapshot.files, current.submittedFiles.files.map(({ description, ...file }) => file), 'The formal result must use the cumulative committed versions rather than current workspace bytes');
+  assert.deepEqual(snapshot.submittedFiles, current.submittedFiles);
+  assert.equal((await snapshotRead(snapshot.id, 'report.md')).content, updatedReport);
+  assert.equal((await snapshotRead(snapshot.id, 'details.md')).content, details);
+  const draft = await app.json(`project/file?${new URLSearchParams({ projectId: project.id, taskId: task.id, path: 'draft.md' })}`);
+  assert.match(draft.content, /草稿已修改/, 'Unsubmitted workspace files remain untouched');
+  assert.equal((await app.call('file', { taskId: task.id, path: 'report.md', content: 'cannot overwrite' })).status, 400);
+  await app.json('task/action', { id: task.id, revision: response.task.revision, action: 'resume' });
+  const resumed = await preview();
+  assert.deepEqual(resumed.submittedFiles, current.submittedFiles, 'Continuing work must retain the cumulative committed files');
+  await app.json('file', { taskId: task.id, path: 'report.md', content: '继续修改后仍未重新提交的工作副本' });
+  const resumedCurrent = await preview(), recompleted = (await app.json('task/completion', args(resumedCurrent))).task;
+  assert.notEqual(recompleted.completedId, snapshot.id);
+  assert.equal((await snapshotRead(recompleted.completedId, 'report.md')).content, updatedReport);
+  assert.equal((await snapshotRead(snapshot.id, 'report.md')).content, updatedReport, 'Continuing and completing again must preserve the previous formal snapshot');
+  const withoutFilesTask = await app.json('task/quick', { projectId: project.id, title: 'HTTP 显式不提交文件完成' });
+  await app.json('file', { taskId: withoutFilesTask.id, path: 'retained.md', content: '必须留在原工作区的文件' });
+  const withoutPreview = await app.json(`task/completion?taskId=${withoutFilesTask.id}`), withoutArgs = args(withoutPreview);
+  assert.equal((await app.call('task/completion', { ...withoutArgs, confirmWithoutFiles: false })).status, 400, 'False does not acknowledge the no-file completion choice');
+  assert.equal((await app.call('task/completion', { ...withoutArgs, confirmWithoutFiles: 'true' })).status, 400, 'No-file confirmation must be an explicit boolean');
+  assert.equal((await app.call('task/completion', { ...withoutArgs, confirmWithoutFiles: true, submissionId: 'forged' })).status, 400, 'No-file choice and a file submission cannot be combined');
+  await app.json('file', { taskId: withoutFilesTask.id, path: 'retained.md', content: '必须保留的更新文件' });
+  assert.equal((await app.call('task/completion', { ...withoutArgs, confirmWithoutFiles: true })).status, 400, 'No-file completion must also reject stale workspace previews');
+  const noFileCurrent = await app.json(`task/completion?taskId=${withoutFilesTask.id}`);
+  const noFileResult = await app.json('task/completion', { ...args(noFileCurrent), confirmWithoutFiles: true });
+  assert.equal(noFileResult.task.state, 'completed');
+  const { snapshot: noFileSnapshot } = await app.json(`snapshot?taskId=${withoutFilesTask.id}`);
+  assert.deepEqual(noFileSnapshot.files, []); assert.equal(noFileSnapshot.submittedFiles, undefined);
+  assert.equal(noFileSnapshot.humanConfirmation.withoutSubmittedFiles, true); assert.equal(noFileSnapshot.humanConfirmation.goals.find(goal => goal.system).checked, false);
+  const retained = await app.json(`project/file?${new URLSearchParams({ projectId: project.id, taskId: withoutFilesTask.id, path: 'retained.md' })}`);
+  assert.equal(retained.content, '必须保留的更新文件');
+  const emptyTask = await app.json('task/quick', { projectId: project.id, title: 'HTTP 零文件完成' });
+  const emptyPreview = await app.json(`task/completion?taskId=${emptyTask.id}`);
+  const emptyResult = await app.json('task/completion', { ...args(emptyPreview), confirmWithoutFiles: true });
+  assert.equal(emptyResult.task.state, 'completed'); assert.deepEqual((await app.json(`snapshot?taskId=${emptyTask.id}`)).snapshot.files, []);
+  // The final leaves do not imply their intermediate task groups were accepted.
+  const rootGroup = await app.json('task/quick', { projectId: project.id, title: '人工确认的顶层任务组' });
+  await app.json('file', { taskId: rootGroup.id, path: 'summary.md', content: '人工确认的组级汇总文件' });
+  await app.json('file', { taskId: rootGroup.id, path: 'group-draft.md', content: '未提交的组级草稿' });
+  const rootCurrent = await app.json(`task?id=${rootGroup.id}`);
+  const rootMetadata = await app.json('task/metadata', { id: rootGroup.id, revision: rootCurrent.revision, title: rootGroup.title,
+    goal: '核对直接子任务与中间任务组的完整结果', checklist: [{ text: '所有直接子节点都已明确完成' }, { text: '组级摘要与子任务成果一致' }] });
+  const middleGroup = await app.json('task/quick', { projectId: project.id, parentId: rootGroup.id, title: '必须单独确认的中间任务组' });
+  const nestedLeaf = await app.json('task/quick', { projectId: project.id, parentId: middleGroup.id, title: '中间组的具体叶任务' });
+  const directLeaf = await app.json('task/quick', { projectId: project.id, parentId: rootGroup.id, title: '顶层组的另一个叶任务' });
+  const groupPreview = id => app.json(`task/completion?taskId=${id}`);
+  const noFilesComplete = async id => {
+    const current = await groupPreview(id);
+    assert.deepEqual(current.blockers, []);
+    return (await app.json('task/completion', { ...args(current), confirmWithoutFiles: true })).task;
+  };
+  const incompleteMiddle = await groupPreview(middleGroup.id), incompleteRoot = await groupPreview(rootGroup.id);
+  assert.equal(incompleteMiddle.isFolder, true); assert.equal(incompleteRoot.isFolder, true);
+  assert.equal(incompleteMiddle.children.length, 1); assert.equal(incompleteMiddle.children[0].taskId, nestedLeaf.id); assert.equal(incompleteMiddle.children[0].ready, false);
+  assert.equal(incompleteRoot.children.length, 2); assert.ok(incompleteRoot.blockers.length > 0);
+  assert.equal((await app.call('task/completion', { ...args(incompleteMiddle), confirmWithoutFiles: true })).status, 400, 'A group cannot finish before each direct child has completed');
+  assert.equal((await app.call('task/action', { id: middleGroup.id, revision: incompleteMiddle.taskRevision, action: 'complete' })).status, 400, 'Legacy Complete must not bypass the human group dialog');
+
+  await app.json('file', { taskId: nestedLeaf.id, path: 'report.md', content: '明确人工提交的嵌套叶任务成果' });
+  const nestedPreview = await groupPreview(nestedLeaf.id);
+  const nestedSubmission = await app.json('task/completion/files', { taskId: nestedLeaf.id, revision: nestedPreview.taskRevision,
+    workspaceVersion: nestedPreview.workspaceVersion, files: [{ path: 'report.md', description: '嵌套任务组输入的正式报告' }] });
+  const nestedResult = (await app.json('task/completion', args(nestedSubmission))).task;
+  assert.notEqual((await app.json(`task?id=${middleGroup.id}`)).state, 'completed', 'Completing a leaf must not auto-complete its containing group');
+  await noFilesComplete(directLeaf.id);
+  const pendingRoot = await groupPreview(rootGroup.id);
+  assert.equal((await app.json(`task?id=${rootGroup.id}`)).leafStats.states.completed, 2);
+  assert.ok(pendingRoot.blockers.length > 0, 'All terminal leaves being completed is insufficient when the intermediate group is not confirmed');
+  assert.equal(pendingRoot.children.find(child => child.taskId === middleGroup.id).ready, false);
+  assert.equal((await app.call('task/completion', { ...args(pendingRoot), confirmWithoutFiles: true })).status, 400);
+
+  const readyMiddle = await groupPreview(middleGroup.id);
+  assert.deepEqual(readyMiddle.blockers, []); assert.ok(readyMiddle.childrenVersion); assert.equal(readyMiddle.children[0].snapshotId, nestedResult.completedId);
+  assert.equal((await app.call('task/completion', { ...args(readyMiddle), checkedGoalIds: [], confirmWithoutFiles: true })).status, 400, 'A ready group still needs all human target checkboxes');
+  const missingChildrenVersion = { ...args(readyMiddle), confirmWithoutFiles: true }; delete missingChildrenVersion.childrenVersion;
+  assert.equal((await app.call('task/completion', missingChildrenVersion)).status, 400, 'Group confirmation must bind the previewed direct-child results');
+  assert.equal((await app.call('task/completion', { ...args(readyMiddle), childrenVersion: 'forged-child-version', confirmWithoutFiles: true })).status, 400);
+  assert.equal((await app.call('task/action', { id: middleGroup.id, revision: readyMiddle.taskRevision, action: 'complete' })).status, 400, 'A ready group cannot use the older action route to auto-submit');
+  assert.equal((await app.call('task/action', { id: middleGroup.id, revision: readyMiddle.taskRevision, action: 'aggregate' })).status, 400, 'Aggregate must not bypass explicit group confirmation either');
+  const confirmedMiddle = await noFilesComplete(middleGroup.id);
+  assert.notEqual((await app.json(`task?id=${rootGroup.id}`)).state, 'completed', 'Confirming a child group must leave its own parent for a separate human confirmation');
+  const middleSnapshot = (await app.json(`snapshot?taskId=${middleGroup.id}`)).snapshot;
+  assert.deepEqual(middleSnapshot.childrenRefs, [{ taskId: nestedLeaf.id, snapshotId: nestedResult.completedId }]);
+  assert.equal(middleSnapshot.humanConfirmation.childrenVersion, readyMiddle.childrenVersion);
+  assert.equal(middleSnapshot.humanConfirmation.withoutSubmittedFiles, true); assert.deepEqual(middleSnapshot.files, []);
+
+  const readyRoot = await groupPreview(rootGroup.id);
+  assert.deepEqual(readyRoot.blockers, []); assert.ok(readyRoot.children.every(child => child.ready));
+  assert.deepEqual(readyRoot.files.map(file => file.path), ['group-draft.md', 'summary.md'], 'A group previews only its own saved workspace files');
+  const rootSubmission = await app.json('task/completion/files', { taskId: rootGroup.id, revision: readyRoot.taskRevision,
+    workspaceVersion: readyRoot.workspaceVersion, files: [{ path: 'summary.md', description: '汇总已人工完成的子任务与中间任务组' }] });
+  const rootResult = (await app.json('task/completion', args(rootSubmission))).task;
+  assert.equal(rootResult.state, 'completed'); assert.equal(rootResult.title, rootMetadata.title);
+  const rootSnapshot = (await app.json(`snapshot?taskId=${rootGroup.id}`)).snapshot;
+  assert.deepEqual(rootSnapshot.files.map(file => file.path), ['summary.md']);
+  assert.deepEqual(rootSnapshot.childrenRefs, readyRoot.children.map(child => ({ taskId: child.taskId, snapshotId: child.snapshotId })));
+  assert.equal(rootSnapshot.humanConfirmation.childrenVersion, readyRoot.childrenVersion);
+  assert.deepEqual(rootSnapshot.humanConfirmation.goals.filter(goal => !goal.system).map(goal => goal.id), readyRoot.goals.filter(goal => !goal.system).map(goal => goal.id));
+  const groupDraft = await app.json(`project/file?${new URLSearchParams({ projectId: project.id, taskId: rootGroup.id, path: 'group-draft.md' })}`);
+  assert.equal(groupDraft.content, '未提交的组级草稿', 'Manual group completion must preserve unsubmitted workspace files');
+  const emptyLegacyGroup = await app.json('task', { projectId: project.id, title: '没有子任务的旧版任务组', kind: 'group' });
+  const emptyGroupPreview = await groupPreview(emptyLegacyGroup.id);
+  assert.equal(emptyGroupPreview.isFolder, true); assert.deepEqual(emptyGroupPreview.children, []); assert.ok(emptyGroupPreview.blockers.length > 0);
+  assert.equal((await app.call('task/completion', { ...args(emptyGroupPreview), confirmWithoutFiles: true })).status, 400, 'An empty legacy task group cannot create a meaningless completed group result');
+  const legacyWorkspace = join(home, 'studio', 'workspaces', emptyLegacyGroup.id);
+  await mkdir(join(legacyWorkspace, '.chat-tmp'), { recursive: true });
+  await writeFile(join(legacyWorkspace, 'legacy-summary.md'), '旧任务组已保存文件，仅允许人工只读预览');
+  await writeFile(join(legacyWorkspace, '.chat-tmp', 'private.md'), '不能通过人工文件预览读取的临时内容');
+  await symlink(join(home, 'studio', 'workspaces', task.id, 'report.md'), join(legacyWorkspace, 'outside.md'));
+  const legacyFileQuery = (projectId = project.id, path = 'legacy-summary.md') => `project/file?${new URLSearchParams({ projectId, taskId: emptyLegacyGroup.id, path })}`;
+  const legacyRead = await app.json(legacyFileQuery());
+  assert.equal(legacyRead.status, 'text'); assert.equal(legacyRead.content, '旧任务组已保存文件，仅允许人工只读预览');
+  assert.equal((await app.call(`project/files?${new URLSearchParams({ projectId: project.id, taskId: emptyLegacyGroup.id })}`)).status, 400, 'Legacy group content previews must not broaden project directory-list authority');
+  const otherGroupProject = await app.json('projects', { title: '旧任务组预览范围隔离' });
+  assert.equal((await app.call(legacyFileQuery(otherGroupProject.id))).status, 400, 'Legacy group preview must still enforce project ownership');
+  for (const path of ['../report.md', '.chat-tmp/private.md', 'outside.md']) assert.equal((await app.call(legacyFileQuery(project.id, path))).status, 400, 'Traversal, private scratch and symlink paths must remain denied');
+  assert.equal((await app.call('file', { taskId: emptyLegacyGroup.id, path: 'legacy-summary.md', content: 'must not allow group artifact writes' })).status, 400);
+
+  // Native DSH context must follow the group snapshots that humans confirmed.
+  const consumer = await app.json('task/quick', { projectId: project.id, title: '读取人工完成的组级输入' });
+  await app.json('dependencies', { id: consumer.id, revision: consumer.revision, dependencies: [rootGroup.id] });
+  const contextChat = await app.json('chat', { taskId: consumer.id, provider: 'studio-smoke', model: 'm1-smoke',
+    message: `[task-input-context] actual ${nestedResult.completedId}; unrelated ${response.task.completedId}` });
+  const contextHistory = await finishedChat(app, contextChat.id);
+  const contextCall = contextHistory.events.find(event => event.type === 'tool/call' && event.data.name === 'studio_task_context');
+  assert.ok(contextCall);
+  const contextResult = contextHistory.events.find(event => event.type === 'tool/result' && event.data.message.source.callId === contextCall.data.callId);
+  assert.equal(contextResult.data.message.isError, false);
+  const context = JSON.parse(contextResult.data.message.content.filter(block => block.type === 'text').map(block => block.text).join(''));
+  assert.deepEqual(context.inputs, [{ taskId: rootGroup.id, snapshotId: rootResult.completedId }]);
+  assert.ok(context.inputSnapshots.some(row => row.snapshotId === rootResult.completedId));
+  assert.ok(context.inputSnapshots.some(row => row.snapshotId === confirmedMiddle.completedId));
+  assert.ok(context.inputSnapshots.some(row => row.snapshotId === nestedResult.completedId));
+  const fileCalls = contextHistory.events.filter(event => event.type === 'tool/call' && event.data.name === 'studio_read_file');
+  const fileResults = fileCalls.map(call => contextHistory.events.find(event => event.type === 'tool/result' && event.data.message.source.callId === call.data.callId));
+  assert.equal(fileResults[0].data.message.isError, false); assert.equal(fileResults[1].data.message.isError, true);
+  const rowsBefore = conversationRows(foldChatPacket(emptyChatState(), { type: 'snapshot', chat: contextHistory, live: [] }));
+  await stopApp(app.child); app = undefined;
+  // Archive fixtures are created offline only in this disposable database;
+  // production exposes no broad archive mutation solely for test setup.
+  const database = new DatabaseSync(join(home, 'studio', 'domain.sqlite'));
+  try {
+    const archived = JSON.parse(String(database.prepare('SELECT value FROM tasks WHERE id=?').get(emptyLegacyGroup.id).value));
+    archived.archived = true; archived.revision++;
+    database.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(archived), archived.id);
+  } finally { database.close(); }
+  app = await startApp(home);
+  assert.equal((await app.call(legacyFileQuery())).status, 400, 'Human-only legacy group previews must still deny archived task workspaces');
+  assert.equal((await app.json(`task?id=${task.id}`)).completedId, recompleted.completedId);
+  assert.deepEqual((await preview()).submittedFiles, current.submittedFiles, 'Cumulative committed files must remain available after completion and restart');
+  assert.equal(await readFile(submittedPath(current.submittedFiles, 'report.md'), 'utf8'), updatedReport);
+  assert.equal((await snapshotRead(recompleted.completedId, 'report.md')).content, updatedReport);
+  assert.equal((await snapshotRead(recompleted.completedId, 'details.md')).content, details);
+  assert.equal((await app.json(`task?id=${rootGroup.id}`)).completedId, rootResult.completedId);
+  assert.equal((await app.json(`task?id=${middleGroup.id}`)).completedId, confirmedMiddle.completedId);
+  assert.deepEqual((await app.json(`snapshot?taskId=${rootGroup.id}`)).snapshot, rootSnapshot);
+  const recoveredContext = await app.json(`chat?id=${contextChat.id}`);
+  assert.deepEqual(recoveredContext.events, contextHistory.events);
+  assert.deepEqual(conversationRows(foldChatPacket(emptyChatState(), { type: 'snapshot', chat: recoveredContext, live: [] })), rowsBefore);
+  const deletion = await app.json(`task/delete-preview?${new URLSearchParams({ id: task.id })}`);
+  await app.json('task/delete', { id: task.id, revision: deletion.taskRevision, projectRevision: deletion.projectRevision, confirm: true });
+  assert.equal((await app.call(`task?id=${task.id}`)).status, 400);
+  await assert.rejects(stat(join(home, 'studio', 'workspaces', task.id)), { code: 'ENOENT' });
+  await assert.rejects(stat(join(home, 'studio', 'file-submissions', task.id)), { code: 'ENOENT' }, 'Leaf deletion must remove every committed batch');
+  for (const snapshotId of [snapshot.id, recompleted.completedId]) await assert.rejects(stat(join(home, 'studio', 'snapshots', snapshotId)), { code: 'ENOENT' });
+  assert.deepEqual((await app.json(`snapshot?taskId=${rootGroup.id}`)).snapshot, rootSnapshot, 'Deleting an unrelated leaf must preserve other tasks\' formal snapshots');
+  console.log('Completion HTTP verification passed: cumulative immutable file submissions, same-path replacement with prior bytes retained, workspace/metadata/resume preservation, submitted-byte final snapshots, restart recovery and leaf deletion cleanup; stale preview and manual-check guards, explicit no-file confirmation, immediate-child group confirmation, legacy preview boundaries and exact native nested-input replay.');
+} finally {
+  if (app) await stopApp(app.child);
+  // Snapshot directories are intentionally read-only; release only this fixture.
+  const { chmod, readdir, lstat } = await import('node:fs/promises');
+  async function release(path) {
+    const info = await lstat(path); if (info.isSymbolicLink()) return;
+    if (info.isDirectory()) { await chmod(path, 0o700); for (const name of await readdir(path)) await release(join(path, name)); }
+    else await chmod(path, 0o600);
+  }
+  await release(home); await rm(home, { recursive: true, force: true });
+}

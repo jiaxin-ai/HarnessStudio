@@ -1,0 +1,13 @@
+# With vm_manager and the sandbox: sandboxes see the D:/F: folders Studio grants each conversation, mounted from
+# vm_manager's projects folder (read-only here; sandbox-manager checks paths and passes them to the sandbox).
+services:
+  sandbox-manager:
+    environment:
+      SANDBOX_PROJECTS_ROOT: ${HS_VMM_PROJECTS_ROOT:?}
+    volumes:
+      - type: bind
+        source: ${HS_VMM_PROJECTS_ROOT}
+        target: ${HS_VMM_PROJECTS_ROOT}
+        read_only: true
+        bind:
+          create_host_path: false

@@ -1,0 +1,108 @@
+# Overlay: the Agent's Linux sandbox (studio_sandbox_run). Use together with compose.vm-manager.yml.
+#
+# sandbox-manager starts one container per conversation through the host's Docker socket and is reachable only
+# on Studio's internal network (no host port). Each sandbox runs with STUDIO_SANDBOX_RUNTIME (gVisor runsc; it must
+# be installed on the host) on an internal network whose only way out is sandbox-egress, an HTTP(S) proxy that
+# refuses the LAN, this host and private addresses. That network's bridge has no host address (inhibit_ipv4):
+# an internal network alone still lets containers reach services listening on the host, such as vm_manager.
+# Sandboxes see only the D:/F: folders Studio grants each conversation, mounted from vm_manager's projects folder,
+# and the global skill library and plugins read-only from Studio's data volume.
+#
+# Users switch the sandbox on or off and choose its limits on the settings page; the STUDIO_SANDBOX_MAX_* values
+# below are the ceilings they can choose up to.
+#
+# Needs ${STUDIO_DEPLOY_SECRETS_DIR}/sandbox-token (32-128 characters of A-Z a-z 0-9 _ -) and the images built from
+# this repository: harnessstudio/sandbox-manager, harnessstudio/sandbox, harnessstudio/sandbox-egress.
+services:
+  studio:
+    environment:
+      STUDIO_SANDBOX_URL: http://sandbox-manager:8100
+      STUDIO_SANDBOX_TOKEN_FILE: /run/secrets/sandbox_token
+      NO_PROXY: ${STUDIO_NO_PROXY:-localhost,127.0.0.1,::1,mock-seat,sandbox-manager}
+    secrets: [mock_seat_token, provider_env, sandbox_token]
+  sandbox-manager:
+    image: harnessstudio/sandbox-manager:${STUDIO_SANDBOX_TAG:-1}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: sandbox-manager
+    init: true
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    # Compose mounts the secret file as is (the deploy user's, mode 600); holding the Docker socket is root on the
+    # host anyway, so reading it adds nothing.
+    cap_add: [DAC_READ_SEARCH]
+    networks: [studio]
+    expose: ['8100']
+    secrets: [sandbox_token]
+    environment:
+      SANDBOX_TOKEN_FILE: /run/secrets/sandbox_token
+      SANDBOX_PROJECTS_ROOT: '${STUDIO_VMM_PROJECTS_ROOT:?请设置 STUDIO_VMM_PROJECTS_ROOT 为 vm_manager 数据目录下 projects 文件夹的绝对路径}'
+      SANDBOX_IMAGE: harnessstudio/sandbox:${STUDIO_SANDBOX_TAG:-1}
+      SANDBOX_RUNTIME: ${STUDIO_SANDBOX_RUNTIME:-runsc}
+      SANDBOX_NETWORK: ${STUDIO_SANDBOX_NETWORK:-harnessstudio-sandbox}
+      SANDBOX_PROXY: http://${STUDIO_SANDBOX_PROXY_IP:-172.29.250.2}:3128
+      SANDBOX_MAX_CPUS: ${STUDIO_SANDBOX_MAX_CPUS:-4}
+      SANDBOX_MAX_MEMORY_GB: ${STUDIO_SANDBOX_MAX_MEMORY_GB:-8}
+      SANDBOX_MAX_RUNNING: ${STUDIO_SANDBOX_MAX_RUNNING:-8}
+      # Studio's data volume (<compose project>_studio-data): its studio/skills and studio/plugins are mounted
+      # read-only at /skills and /plugins.
+      SANDBOX_STUDIO_VOLUME: ${STUDIO_SANDBOX_STUDIO_VOLUME:-harnessstudio_studio-data}
+      SANDBOX_STUDIO_SUBPATH: studio
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: '${STUDIO_VMM_PROJECTS_ROOT:?请设置 STUDIO_VMM_PROJECTS_ROOT 为 vm_manager 数据目录下 projects 文件夹的绝对路径}'
+        target: '${STUDIO_VMM_PROJECTS_ROOT}'
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+  sandbox-egress:
+    image: harnessstudio/sandbox-egress:${STUDIO_SANDBOX_TAG:-1}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: sandbox-egress
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /run/squid:mode=1777,size=1m
+      - /var/spool/squid:mode=1777,size=16m
+      - /var/log/squid:mode=1777,size=16m
+      - /var/cache/squid:mode=1777,size=16m
+      - /tmp:mode=1777,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    networks:
+      sandbox:
+        ipv4_address: ${STUDIO_SANDBOX_PROXY_IP:-172.29.250.2}
+      sandbox-egress: {}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+secrets:
+  sandbox_token:
+    file: ${STUDIO_DEPLOY_SECRETS_DIR:-../.studio/deploy/secrets}/sandbox-token
+networks:
+  sandbox:
+    name: ${STUDIO_SANDBOX_NETWORK:-harnessstudio-sandbox}
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.inhibit_ipv4: 'true'
+    ipam:
+      config:
+        - subnet: ${STUDIO_SANDBOX_SUBNET:-172.29.250.0/24}
+          ip_range: ${STUDIO_SANDBOX_IP_RANGE:-172.29.250.128/25}
+  sandbox-egress: {}

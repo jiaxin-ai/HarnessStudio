@@ -1,0 +1,10 @@
+# Overlay: publish Studio on the LAN. The address people use comes from the environment, so nothing here belongs to one machine.
+#   STUDIO_PUBLIC_HOST      the address typed in browsers: this server's LAN IP or host name (required)
+#   STUDIO_PUBLISHED_PORT   the published port (default 3080)
+services:
+  studio:
+    ports: !override
+      - '0.0.0.0:${STUDIO_PUBLISHED_PORT:-3080}:3080'
+    environment:
+      STUDIO_PUBLIC_URL: 'http://${STUDIO_PUBLIC_HOST:?请设置 STUDIO_PUBLIC_HOST 为别人访问用的地址（本机的局域网 IP 或主机名）}:${STUDIO_PUBLISHED_PORT:-3080}/'
+      STUDIO_TRUSTED_HOSTS: '${STUDIO_PUBLIC_HOST}:${STUDIO_PUBLISHED_PORT:-3080}'

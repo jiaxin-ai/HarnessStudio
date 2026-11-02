@@ -1,0 +1,26 @@
+# Host-installed nginx example. Supply real TLS certificates and replace the
+# authority here AND in STUDIO_PUBLIC_URL / STUDIO_TRUSTED_HOSTS.
+# These declarations belong in nginx's http {} block.
+map $http_upgrade $studio_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+# Do not log query strings, launch tokens, authorization headers or cookies.
+log_format studio_safe '$remote_addr [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent';
+server {
+    listen 443 ssl;
+    server_name studio.example.com;
+    ssl_certificate /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+    access_log /var/log/nginx/studio-access.log studio_safe;
+    client_max_body_size 32m;
+    location / {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $studio_connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+}

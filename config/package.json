@@ -1,0 +1,8 @@
+{
+  "name": "@harnessstudio/bundle",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dsh": { "bundle": { "patch": "./studio.patch.yml" } },
+  "peerDependencies": { "@deepseek-ai/dsh": "0.2.1-alpha.1" }
+}

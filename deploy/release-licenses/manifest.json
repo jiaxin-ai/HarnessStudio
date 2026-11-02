@@ -1,0 +1,180 @@
+{
+  "upstreamCommit": "5badb15009ae1756c3afe0ae0cef1faafc290ccc",
+  "entries": [
+    {
+      "name": "deepseek-harness",
+      "version": "5badb15009ae1756c3afe0ae0cef1faafc290ccc",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/dsh-upstream/LICENSE"
+      ]
+    },
+    {
+      "name": "@xyflow/react",
+      "version": "12.12.0",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/xyflow__react/LICENSE"
+      ]
+    },
+    {
+      "name": "ipaddr.js",
+      "version": "2.5.0",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/ipaddr.js/LICENSE"
+      ]
+    },
+    {
+      "name": "pdfjs-dist",
+      "version": "6.3.289",
+      "license": "Apache-2.0",
+      "files": [
+        "deploy/release-licenses/pdfjs-dist/LICENSE",
+        "deploy/release-licenses/pdfjs-dist/cmaps/LICENSE",
+        "deploy/release-licenses/pdfjs-dist/iccs/LICENSE",
+        "deploy/release-licenses/pdfjs-dist/standard_fonts/LICENSE_FOXIT",
+        "deploy/release-licenses/pdfjs-dist/standard_fonts/LICENSE_LIBERATION",
+        "deploy/release-licenses/pdfjs-dist/wasm/LICENSE_JBIG2",
+        "deploy/release-licenses/pdfjs-dist/wasm/LICENSE_OPENJPEG",
+        "deploy/release-licenses/pdfjs-dist/wasm/LICENSE_PDFJS_JBIG2",
+        "deploy/release-licenses/pdfjs-dist/wasm/LICENSE_PDFJS_OPENJPEG",
+        "deploy/release-licenses/pdfjs-dist/wasm/LICENSE_PDFJS_QCMS",
+        "deploy/release-licenses/pdfjs-dist/wasm/LICENSE_QCMS"
+      ]
+    },
+    {
+      "name": "react",
+      "version": "18.3.1",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/react/LICENSE"
+      ]
+    },
+    {
+      "name": "react-dom",
+      "version": "18.3.1",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/react-dom/LICENSE"
+      ]
+    },
+    {
+      "name": "react-markdown",
+      "version": "10.1.0",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/react-markdown/license"
+      ]
+    },
+    {
+      "name": "react-json-tree",
+      "version": "0.20.0",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/react-json-tree/LICENSE.md"
+      ]
+    },
+    {
+      "name": "zod",
+      "version": "4.4.3",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/zod/LICENSE"
+      ]
+    },
+    {
+      "name": "playwright-core",
+      "version": "1.64.0",
+      "license": "Apache-2.0",
+      "files": [
+        "deploy/release-licenses/playwright-core/LICENSE",
+        "deploy/release-licenses/playwright-core/LICENSE_NOTICE",
+        "deploy/release-licenses/playwright-core/LICENSE_THIRD_PARTY_NOTICES",
+        "deploy/release-licenses/playwright-core/LICENSE_SERVER_REGISTRY",
+        "deploy/release-licenses/playwright-core/LICENSE_UTILS_BUNDLE",
+        "deploy/release-licenses/playwright-core/LICENSE_WEBP_CODEC"
+      ]
+    },
+    {
+      "name": "remark-gfm",
+      "version": "4.0.1",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/remark-gfm/license"
+      ]
+    },
+    {
+      "name": "undici",
+      "version": "8.11.2",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/undici/LICENSE"
+      ]
+    },
+    {
+      "name": "yauzl",
+      "version": "3.4.0",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/yauzl/LICENSE"
+      ]
+    },
+    {
+      "name": "@types/node",
+      "version": "24.19.1",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/types__node/LICENSE"
+      ]
+    },
+    {
+      "name": "@types/react",
+      "version": "18.3.31",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/types__react/LICENSE"
+      ]
+    },
+    {
+      "name": "@types/react-dom",
+      "version": "18.3.7",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/types__react-dom/LICENSE"
+      ]
+    },
+    {
+      "name": "esbuild",
+      "version": "0.25.12",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/esbuild/LICENSE.md"
+      ]
+    },
+    {
+      "name": "typescript",
+      "version": "6.0.3",
+      "license": "Apache-2.0",
+      "files": [
+        "deploy/release-licenses/typescript/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "@napi-rs/canvas",
+      "version": "1.0.11",
+      "license": "MIT",
+      "files": [
+        "deploy/release-licenses/napi-rs__canvas/LICENSE"
+      ]
+    },
+    {
+      "name": "yaml",
+      "version": "2.9.1",
+      "license": "ISC",
+      "files": [
+        "deploy/release-licenses/yaml/LICENSE"
+      ]
+    }
+  ]
+}

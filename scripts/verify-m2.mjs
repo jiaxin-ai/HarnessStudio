@@ -1,0 +1,65 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, readdir, chmod, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { root, upstream, upstreamCommit } from './prepare.mjs';
+import { startApp, stopApp, finishedChat } from './verify-app.mjs';
+await mkdir(join(root, '.studio'), { recursive: true }); const home = await mkdtemp(join(root, '.studio/m2-test-'));
+let app;
+const spec = title => ({ title, kind: 'task', goal: '按演示数据验证具体零件目标，不用于真实工程', criteria: [{ id: 'width', label: '齿宽', kind: 'numeric', rule: 'eq', target: 40, unit: 'mm', tolerance: 0.1, method: '核对文本报告' }], outputs: ['report.md'], unresolved: [] });
+const measurements = [{ criterionId: 'width', observed: 40, evidence: 'report.md', note: '演示报告记录的尺寸为 40 mm' }];
+async function action(id, action, extra = {}) { const task = await app.json(`task?id=${id}`); return app.json('task/action', { id, revision: task.revision, action, ...extra }); }
+async function release(path) { await chmod(path, 0o700); for (const row of await readdir(path, { withFileTypes: true })) if (row.isDirectory()) await release(join(path, row.name)); }
+try {
+  app = await startApp(home, 'reviewed');
+  assert.equal((await fetch(`${app.base}/api/studio/projects`)).status, 200);
+  assert.equal((await fetch(`${app.base}/api/studio/directory`)).status, 200);
+  const project = await app.json('projects', { title: 'M2 轴系任务验收（测试）', goal: '验证任务依赖、状态和快照' });
+  const group = await app.json('task', { projectId: project.id, title: '齿轮与轴承', kind: 'group', goal: '组织具体子任务' });
+  const gear = await app.json('task', { ...spec('校核驱动齿轮齿宽'), projectId: project.id, parentId: group.id });
+  const bearing = await app.json('task', { ...spec('验证支承轴承安装接口'), projectId: project.id, parentId: group.id });
+  const numbered = [group, gear, bearing];
+  for (const task of numbered) assert.match(task.code, /^[0-9A-Za-z]{5}$/);
+  assert.deepEqual(numbered.map(task => task.rank), [1, 2, 3]);
+  const directory = await app.json('directory'); assert.equal(new Set(directory.map(task => task.code)).size, directory.length);
+  assert.deepEqual(directory.filter(task => task.projectId === project.id).map(task => task.id), numbered.map(task => task.id));
+  await app.json('dependencies', { id: bearing.id, revision: bearing.revision, dependencies: [gear.id] });
+  assert.equal((await app.call('dependencies', { id: gear.id, revision: gear.revision, dependencies: [bearing.id] })).status, 400);
+  await action(bearing.id, 'claim'); assert.equal((await app.call('file', { taskId: bearing.id, path: 'report.md', content: 'too early' })).status, 400);
+  assert.equal((await app.call('file', { taskId: gear.id, path: 'report.md', content: 'unclaimed work' })).status, 400);
+  await action(gear.id, 'claim');
+  await action(gear.id, 'start');
+  const chat = await app.json('chat', { taskId: gear.id, provider: 'studio-smoke', model: 'm1-smoke', message: 'Controlled M2 tool proof' }); await finishedChat(app, chat.id);
+  assert.equal((await app.json(`task?id=${gear.id}`)).state, 'working');
+  assert.ok((await app.json(`file?taskId=${gear.id}&path=m1-proof.txt`)).content.includes('测试数据'));
+  await app.json('file', { taskId: gear.id, path: 'report.md', content: '齿宽 40 mm；M2 测试报告' });
+  const slow = await app.json('chat', { taskId: gear.id, provider: 'studio-smoke', model: 'm1-smoke', message: '[slow]' });
+  await action(gear.id, 'submit', { measurements });
+  const candidate = (await app.json(`snapshot?taskId=${gear.id}`)).snapshot;
+  assert.equal((await app.call('file', { taskId: gear.id, path: 'late.md', content: 'after freeze' })).status, 400);
+  assert.equal((await app.call('chat', { taskId: gear.id, id: slow.id, provider: 'studio-smoke', model: 'm1-smoke', message: 'after freeze' })).status, 400);
+  assert.equal((await app.json(`chat?id=${slow.id}`)).status, 'stored');
+  assert.match((await app.json(`snapshot/file?taskId=${gear.id}&snapshotId=${candidate.id}&path=report.md`)).content, /40 mm/);
+  await action(gear.id, 'reject', { reason: '演示初审打回，复核报告说明' });
+  await app.json('file', { taskId: gear.id, path: 'report.md', content: '齿宽 40 mm；返工后 M2 测试报告' });
+  await action(gear.id, 'submit', { measurements }); await action(gear.id, 'accept', { reason: '逐项核对演示指标和证据，正式提交' });
+  const committed = await app.json(`task?id=${gear.id}`), immutable = (await app.json(`snapshot?taskId=${gear.id}`)).snapshot;
+  assert.equal((await app.call('task/action', { id: gear.id, revision: committed.revision, action: 'reject', reason: '不得解冻正式提交' })).status, 400);
+  await app.json('file', { taskId: bearing.id, path: 'report.md', content: '齿宽 40 mm；下游仅为状态测试' });
+  assert.deepEqual((await app.json(`task?id=${bearing.id}`)).inputs, [{ taskId: gear.id, snapshotId: committed.acceptedId }]);
+  await action(bearing.id, 'submit', { measurements }); await action(bearing.id, 'accept', { reason: '下游演示审核通过' });
+  const redo = await action(gear.id, 'discard', { reason: '演示废弃并另建返工节点', redo: true });
+  assert.equal(redo.replacement.state, 'unstarted'); assert.equal((await app.json(`task?id=${bearing.id}`)).state, 'revoked');
+  assert.notEqual(redo.replacement.code, gear.code); assert.equal(redo.replacement.rank, 4);
+  assert.equal((await app.call('file', { taskId: bearing.id, path: 'report.md', content: 'forbidden' })).status, 400);
+  assert.deepEqual((await app.json(`snapshot?taskId=${gear.id}`)).snapshot, immutable);
+  await stopApp(app.child); app = await startApp(home, 'reviewed');
+  assert.equal((await app.json(`task?id=${gear.id}`)).state, 'discarded'); assert.equal((await app.json(`task?id=${bearing.id}`)).state, 'revoked');
+  assert.deepEqual((await app.json(`snapshot?taskId=${gear.id}`)).snapshot, immutable);
+  const graph = await app.json(`graph?projectId=${project.id}`); assert.equal(graph.tasks.length, 4); assert.equal(graph.tasks.find(task => task.id === gear.id).parentId, group.id);
+  assert.deepEqual(graph.tasks.map(task => [task.code, task.rank]), [...numbered, redo.replacement].map(task => [task.code, task.rank]));
+  assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: upstream, encoding: 'utf8' }).trim(), upstreamCommit);
+  assert.equal(execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: upstream, encoding: 'utf8' }).trim(), '');
+  console.log(JSON.stringify({ milestone: 'M2', results: ['Project/leaf/group creation and DAG validation', 'Claim and strict predecessor gating across human and Agent entry points', 'Actual DSH tool work, running Agent quiescence and frozen file/chat rejection', 'First rejection reopens work; passing metrics formally submit immutable snapshots', 'Downstream input references, automatic acceptance revocation, separate redo node and restart recovery', 'Pinned upstream source unchanged'] }, null, 2));
+} catch (error) { console.error(error); process.exitCode = 1; }
+finally { if (app) await stopApp(app.child); await release(home); await rm(home, { recursive: true, force: true }); }

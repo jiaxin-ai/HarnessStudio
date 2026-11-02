@@ -1,0 +1,1042 @@
+#!/usr/bin/env bash
+# harnessstudio: deploy, stop and batch-run HarnessStudio from this source tree. Operations: docs/deploy-cli.md.
+#
+#   harnessstudio                 deploy Studio when needed, then print its address
+#   harnessstudio stop            stop Studio (VMs are not affected)
+#   harnessstudio run tasks.yaml  batch tasks, run by the batch client in the cli image (docs/batch-run.md)
+#
+# The host needs only bash 4+, coreutils, find and Docker with the compose and buildx plugins; Node and everything
+# else run in containers. Functions are prefixed hs_; sourcing the file defines them without running anything.
+
+if [ -z "${BASH_VERSINFO+x}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "harnessstudio 需要 bash 4 或更新的版本（现在是 ${BASH_VERSION:-未知}）。" >&2
+  exit 1
+fi
+set -Eeuo pipefail
+
+# The repository root, also when this file is reached through a symlink on PATH.
+hs_find_root() {
+  local source=${BASH_SOURCE[0]} dir
+  while [ -L "$source" ]; do
+    dir=$(cd -P "$(dirname "$source")" && pwd)
+    source=$(readlink "$source")
+    [[ $source == /* ]] || source=$dir/$source
+  done
+  cd -P "$(dirname "$source")/.." && pwd
+}
+
+HS_ROOT=$(hs_find_root)
+HS_DEPLOY_DIR=$HS_ROOT/.studio/deploy
+HS_SECRETS_DIR=$HS_DEPLOY_DIR/secrets
+HS_HISTORY=$HS_DEPLOY_DIR/history.log
+HS_COMPOSE_DIR=$HS_ROOT/deploy/harnessstudio
+HS_CONFIG_FILE=${HARNESSSTUDIO_CONFIG:-$HS_DEPLOY_DIR/harnessstudio.env}
+[[ $HS_CONFIG_FILE == /* ]] || HS_CONFIG_FILE=$PWD/$HS_CONFIG_FILE
+# Every default install, and the production deployment this repository runs on, use this instance name.
+HS_DEFAULT_INSTANCE=harnessstudio
+HS_KEYS=(HS_INSTANCE HS_PORT HS_BIND HS_PUBLIC_HOST HS_VMM_URL HS_VMM_PROJECTS_ROOT HS_SANDBOX
+  HS_SANDBOX_NETWORK HS_SANDBOX_SUBNET HS_SANDBOX_IP_RANGE HS_SANDBOX_PROXY_IP HS_SMOKE)
+# The configuration file is the only source of settings. HS_* variables in the environment only suggest answers
+# for the first run, so a stray export cannot silently retarget a deployment.
+declare -A HS_ENV=()
+for hs_key in "${HS_KEYS[@]}"; do
+  if [ -n "${!hs_key+x}" ]; then HS_ENV[$hs_key]=${!hs_key}; unset "$hs_key"; fi
+done
+unset hs_key
+
+hs_say() { printf '%s\n' "$*"; }
+hs_note() { printf '%s\n' "$*" >&2; }
+hs_die() { printf 'harnessstudio：%s\n' "$*" >&2; exit 1; }
+hs_failed() { printf 'harnessstudio：意外中止（第 %s 行，退出码 %s）：%s\n' "$2" "$1" "$3" >&2; }
+trap 'hs_failed $? $LINENO "$BASH_COMMAND"' ERR
+
+# HARNESSSTUDIO_INTERACTIVE=1/0 forces question mode on or off (tests feed answers on stdin).
+hs_interactive() {
+  case ${HARNESSSTUDIO_INTERACTIVE:-} in 1) return 0 ;; 0) return 1 ;; esac
+  [ -t 0 ]
+}
+
+# Safety net for the default instance (production, where there is one): scripts and agents run without a terminal, and
+# HARNESSSTUDIO_INTERACTIVE does not count here.
+hs_guard() {
+  if [ "$HS_INSTANCE" = "$HS_DEFAULT_INSTANCE" ] && ! [ -t 0 ]; then
+    hs_die "目标是实例 $HS_DEFAULT_INSTANCE（本机的正式部署），而现在不是在终端里运行：为防误操作，不会$1。请在终端里运行 harnessstudio。"
+  fi
+}
+
+hs_help() {
+  cat <<'EOF'
+用法：
+  harnessstudio            部署并启动 HarnessStudio：还没部署就从这份源码部署，最后打印网址
+  harnessstudio stop       停止 Studio（虚拟机不受影响，数据都保留）
+  harnessstudio run 清单.yaml [--url 地址] [--parallel N] [--out 目录] [--resume 目录] [--no-video]
+                           批量跑任务；不带 --url 时用本机的 Studio，没在运行就先部署
+  harnessstudio --help     显示这段说明
+
+第一次运行时会在终端里问几个问题，答案存在 .studio/deploy/harnessstudio.env，以后改这个文件再运行一次即可。
+代码更新后再运行 harnessstudio，会先问你是否重新部署；每次部署后都会打印一行回滚命令。
+只需要 bash、coreutils 和 Docker（含 compose、buildx 插件）。详细说明：docs/deploy-cli.md
+EOF
+}
+
+# ---------- Docker ----------
+
+hs_require_docker() {
+  command -v docker >/dev/null 2>&1 || hs_die "没有找到 docker 命令。请先安装 Docker Engine：https://docs.docker.com/engine/install/ （Ubuntu 可以用 curl -fsSL https://get.docker.com | sudo sh）。"
+  local info
+  if ! info=$(docker info --format '{{.ServerVersion}}' 2>&1); then
+    case $info in
+      *permission\ denied*) hs_die "当前用户没有权限使用 Docker。执行 sudo usermod -aG docker \$USER，然后退出重新登录。" ;;
+      *) hs_die "连不上 Docker 服务（$info）。启动它：sudo systemctl start docker" ;;
+    esac
+  fi
+  docker compose version >/dev/null 2>&1 || hs_die "缺少 Docker Compose v2 插件。Ubuntu/Debian：sudo apt-get install docker-compose-plugin；其他系统见 https://docs.docker.com/compose/install/"
+}
+
+hs_require_buildx() {
+  docker buildx version >/dev/null 2>&1 || hs_die "构建镜像需要 Docker buildx 插件。Ubuntu/Debian：sudo apt-get install docker-buildx-plugin"
+}
+
+hs_has_runsc() { [[ $(docker info --format '{{json .Runtimes}}' 2>/dev/null || true) == *'"runsc"'* ]]; }
+
+hs_image_id() { docker image inspect --format '{{.Id}}' "$1" 2>/dev/null || true; }
+
+# The container of a service of this instance (any state), by the labels compose puts on it.
+hs_container() {
+  local out
+  out=$(docker ps -a --filter "label=com.docker.compose.project=$HS_INSTANCE" --filter "label=com.docker.compose.service=$1" --format '{{.ID}}')
+  printf '%s' "${out%%$'\n'*}"
+}
+
+hs_inspect() { docker inspect --format "$2" "$1" 2>/dev/null || true; }
+
+hs_label() {
+  local value
+  value=$(hs_inspect "$1" "{{index .Config.Labels \"$2\"}}")
+  [ "$value" = '<no value>' ] && value=''
+  printf '%s' "$value"
+}
+
+# ---------- HTTP without curl: bash /dev/tcp, plain HTTP/1.0, no proxy ----------
+
+# hs_http_get URL [seconds] [Host header] → the whole response on stdout; fails when nothing answers.
+hs_http_get() {
+  local url=$1 seconds=${2:-5} header=${3:-}
+  [[ $url =~ ^http://([^/:]+)(:([0-9]+))?(/.*)?$ ]] || return 2
+  local host=${BASH_REMATCH[1]} port=${BASH_REMATCH[3]:-80} path=${BASH_REMATCH[4]:-/}
+  local runner=()
+  if command -v timeout >/dev/null 2>&1; then runner=(timeout "$seconds"); fi
+  ${runner[@]+"${runner[@]}"} bash -c 'exec 3<>"/dev/tcp/$1/$2" || exit 1
+    printf "GET %s HTTP/1.0\r\nHost: %s\r\nAccept: application/json\r\nConnection: close\r\n\r\n" "$3" "$4" >&3
+    cat <&3' hs-http "$host" "$port" "$path" "${header:-$host:$port}" 2>/dev/null
+}
+
+hs_http_status() { local first=${1%%$'\n'*}; [[ $first =~ ^HTTP/[0-9.]+\ ([0-9]{3}) ]] && printf '%s' "${BASH_REMATCH[1]}"; }
+
+hs_port_busy() {
+  local runner=()
+  if command -v timeout >/dev/null 2>&1; then runner=(timeout 2); fi
+  ${runner[@]+"${runner[@]}"} bash -c 'exec 3<>"/dev/tcp/$1/$2"' hs-port "$1" "$2" 2>/dev/null
+}
+
+# ---------- configuration ----------
+
+hs_known_key() { local key; for key in "${HS_KEYS[@]}"; do [ "$key" = "$1" ] && return 0; done; return 1; }
+
+hs_detect_lan_ip() {
+  local out
+  out=$(ip -4 route get 1.1.1.1 2>/dev/null || true)
+  if [[ $out =~ src\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then printf '%s' "${BASH_REMATCH[1]}"; return; fi
+  out=$(hostname -I 2>/dev/null || true)
+  if [[ $out =~ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then printf '%s' "${BASH_REMATCH[1]}"; return; fi
+  printf '127.0.0.1'
+}
+
+# A 172.29.N.0/24 no Docker network uses yet, so a second instance on a host does not clash with the first.
+hs_free_sandbox_subnet() {
+  local ids used='' n
+  ids=$(docker network ls -q 2>/dev/null || true)
+  # shellcheck disable=SC2086 # one argument per network ID
+  [ -n "$ids" ] && used=$(docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' $ids 2>/dev/null || true)
+  for n in 250 251 252 253 254 249 248 247 246 245 244 243 242 241 240; do
+    [[ " ${used//$'\n'/ } " == *" 172.29.$n.0/24 "* ]] || { printf '172.29.%s.0/24' "$n"; return; }
+  done
+  printf '172.29.250.0/24'
+}
+
+# Default of a key; later keys may depend on earlier ones (HS_KEYS order).
+hs_default() {
+  case $1 in
+    HS_INSTANCE) printf '%s' "$HS_DEFAULT_INSTANCE" ;;
+    HS_PORT) printf '3080' ;;
+    HS_BIND) printf '0.0.0.0' ;;
+    HS_PUBLIC_HOST) if [ "${HS_BIND:-}" = 127.0.0.1 ]; then printf '127.0.0.1'; else hs_detect_lan_ip; fi ;;
+    HS_VMM_URL) printf '' ;;
+    # No default: where vm_manager keeps its data differs per machine; it is asked, or read from a running instance.
+    HS_VMM_PROJECTS_ROOT) printf '' ;;
+    HS_SANDBOX) printf 'auto' ;;
+    HS_SANDBOX_NETWORK) printf '%s-sandbox' "${HS_INSTANCE:-$HS_DEFAULT_INSTANCE}" ;;
+    HS_SANDBOX_SUBNET) printf '172.29.250.0/24' ;;
+    HS_SANDBOX_IP_RANGE) if [[ ${HS_SANDBOX_SUBNET:-} =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.0/24$ ]]; then printf '%s.128/25' "${BASH_REMATCH[1]}"; fi ;;
+    HS_SANDBOX_PROXY_IP) if [[ ${HS_SANDBOX_SUBNET:-} =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.0/24$ ]]; then printf '%s.2' "${BASH_REMATCH[1]}"; fi ;;
+    HS_SMOKE) printf '' ;;
+  esac
+}
+
+hs_fill_defaults() {
+  local key
+  for key in "${HS_KEYS[@]}"; do
+    if [ -z "${!key+x}" ]; then printf -v "$key" '%s' "$(hs_default "$key")"; fi
+  done
+}
+
+# Reads KEY=VALUE lines; unknown keys are errors, so a typo cannot be silently ignored.
+hs_parse_config() {
+  local file=$1 line key value n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1)); line=${line%$'\r'}
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || hs_die "配置文件 $file 第 $n 行看不懂：$line"
+    key=${BASH_REMATCH[1]} value=$(hs_trim "${BASH_REMATCH[2]}")
+    if [[ $value =~ ^\"(.*)\"$ ]] || [[ $value =~ ^\'(.*)\'$ ]]; then value=${BASH_REMATCH[1]}; fi
+    hs_known_key "$key" || hs_die "配置文件 $file 第 $n 行：不认识的配置项 $key。可用的有：${HS_KEYS[*]}"
+    printf -v "$key" '%s' "$value"
+  done < "$file"
+}
+
+hs_validate_config() {
+  local where=${1:-配置文件 $HS_CONFIG_FILE} errors=() cidr='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' ip='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+  [[ $HS_INSTANCE =~ ^[a-z0-9][a-z0-9_-]*$ ]] || errors+=("HS_INSTANCE 只能用小写字母、数字、- 和 _：$HS_INSTANCE")
+  [[ $HS_PORT =~ ^[0-9]{1,5}$ ]] && [ "$HS_PORT" -ge 1 ] && [ "$HS_PORT" -le 65535 ] || errors+=("HS_PORT 要是 1–65535 之间的数字：$HS_PORT")
+  [[ $HS_BIND =~ $ip ]] || errors+=("HS_BIND 要是 IPv4 地址，通常是 0.0.0.0（局域网可访问）或 127.0.0.1（只本机）：$HS_BIND")
+  [[ $HS_PUBLIC_HOST =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || errors+=("HS_PUBLIC_HOST 要是主机名或 IP 地址：$HS_PUBLIC_HOST")
+  if [ -n "$HS_VMM_URL" ]; then
+    HS_VMM_URL=${HS_VMM_URL%/}
+    [[ $HS_VMM_URL =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || errors+=("HS_VMM_URL 要像 http://10.0.0.5:8000 这样（不带路径），或者留空：$HS_VMM_URL")
+    [[ $HS_VMM_URL =~ ^https?://(127\.|localhost) ]] && errors+=("HS_VMM_URL 不能用 127.0.0.1 或 localhost：Studio 在容器里，那指的是容器自己。请填本机的局域网 IP")
+    if [ -z "$HS_VMM_PROJECTS_ROOT" ]; then errors+=("接了 vm_manager（HS_VMM_URL）时要填 HS_VMM_PROJECTS_ROOT：vm_manager 数据目录下 projects 文件夹的绝对路径")
+    elif [[ $HS_VMM_PROJECTS_ROOT != /* ]]; then errors+=("HS_VMM_PROJECTS_ROOT 要是绝对路径：$HS_VMM_PROJECTS_ROOT")
+    fi
+  fi
+  [[ $HS_SANDBOX =~ ^(auto|on|off)$ ]] || errors+=("HS_SANDBOX 只能是 auto、on 或 off：$HS_SANDBOX")
+  [[ $HS_SANDBOX_NETWORK =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || errors+=("HS_SANDBOX_NETWORK 不是有效的网络名：$HS_SANDBOX_NETWORK")
+  [[ $HS_SANDBOX_SUBNET =~ $cidr ]] || errors+=("HS_SANDBOX_SUBNET 要像 172.29.250.0/24：$HS_SANDBOX_SUBNET")
+  [[ $HS_SANDBOX_IP_RANGE =~ $cidr ]] || errors+=("HS_SANDBOX_IP_RANGE 要像 172.29.250.128/25：$HS_SANDBOX_IP_RANGE")
+  [[ $HS_SANDBOX_PROXY_IP =~ $ip ]] || errors+=("HS_SANDBOX_PROXY_IP 要像 172.29.250.2：$HS_SANDBOX_PROXY_IP")
+  [[ $HS_SMOKE =~ ^(|0|1)$ ]] || errors+=("HS_SMOKE 只能是空、0 或 1：$HS_SMOKE")
+  if [ ${#errors[@]} -gt 0 ]; then
+    hs_note "$where 有问题："
+    printf '  - %s\n' "${errors[@]}" >&2
+    exit 1
+  fi
+}
+
+hs_read_config() {
+  local key
+  hs_parse_config "$HS_CONFIG_FILE"
+  hs_fill_defaults
+  hs_validate_config
+  [ "${HS_CONFIG_WRITTEN:-0}" = 1 ] && return 0
+  for key in "${!HS_ENV[@]}"; do
+    if [ "${HS_ENV[$key]}" != "${!key}" ]; then hs_note "注意：环境变量 $key 不起作用，设置以 $HS_CONFIG_FILE 为准。"; fi
+  done
+}
+
+hs_comment() {
+  case $1 in
+    HS_INSTANCE) echo '实例名：决定容器名和数据卷名（<实例名>_studio-data）。同一台机器上部署多份时各用一个名字' ;;
+    HS_PORT) echo '网页端口' ;;
+    HS_BIND) echo '0.0.0.0 = 局域网里的其他电脑也能访问；127.0.0.1 = 只能在本机访问' ;;
+    HS_PUBLIC_HOST) echo '别人在浏览器里访问用的地址（本机局域网 IP 或主机名）；网页只接受用这个地址访问' ;;
+    HS_VMM_URL) echo 'vm_manager 的地址，例如 http://10.0.0.5:8000；空 = 不接虚拟机（无软件模式）' ;;
+    HS_VMM_PROJECTS_ROOT) echo 'vm_manager 数据目录下的 projects 文件夹（接了虚拟机时才用）' ;;
+    HS_SANDBOX) echo 'Agent 的 Linux 沙箱：auto = 装了 gVisor（runsc）就开；on = 必须开；off = 不开' ;;
+    HS_SANDBOX_NETWORK) echo '沙箱网络的名字和网段；同一台机器上部署多份时每份都要不同' ;;
+    HS_SMOKE) echo '只给测试实例用：1 = 加载确定性的测试模型' ;;
+    *) echo '' ;;
+  esac
+}
+
+hs_write_config() {
+  local file=$HS_CONFIG_FILE tmp key comment
+  mkdir -p "$(dirname "$file")"
+  tmp=$file.tmp.$$
+  {
+    echo "# HarnessStudio 部署配置，由 harnessstudio 在 $(date '+%Y-%m-%d %H:%M') 写入。"
+    echo '# 改完再运行一次 harnessstudio 生效（会先问你是否重建）。各项说明见 docs/deploy-cli.md。'
+    for key in "${HS_KEYS[@]}"; do
+      [ "$key" = HS_SMOKE ] && [ -z "$HS_SMOKE" ] && continue
+      comment=$(hs_comment "$key")
+      [ -n "$comment" ] && printf '\n# %s\n' "$comment"
+      printf '%s=%s\n' "$key" "${!key}"
+    done
+  } > "$tmp"
+  mv "$tmp" "$file"
+  HS_CONFIG_WRITTEN=1
+}
+
+hs_print_config() {
+  local key
+  for key in "${HS_KEYS[@]}"; do
+    [ "$key" = HS_SMOKE ] && [ -z "$HS_SMOKE" ] && continue
+    [ "$key" = HS_VMM_PROJECTS_ROOT ] && [ -z "$HS_VMM_URL" ] && continue
+    printf '  %-22s %s\n' "$key" "${!key:-（空）}"
+  done
+}
+
+hs_trim() { [[ $1 =~ ^[[:space:]]*(.*[^[:space:]])?[[:space:]]*$ ]]; printf '%s' "${BASH_REMATCH[1]}"; }
+
+# hs_ask VAR "question" default: an empty answer takes the default.
+# hs_ask VAR "question" default [what to show when there is no default]
+hs_ask() {
+  local hs_reply hs_shown=$3
+  [ -z "$hs_shown" ] && hs_shown=${4:-直接回车表示不填}
+  printf '%s [%s]：' "$2" "$hs_shown" >&2
+  IFS= read -r hs_reply || hs_die "没有读到回答，已中止，什么都没有改。"
+  hs_reply=$(hs_trim "$hs_reply")
+  printf -v "$1" '%s' "${hs_reply:-$3}"
+}
+
+# hs_confirm "question" y|n → succeeds on yes; the default is the second argument.
+hs_confirm() {
+  local answer hint='[y/N]'
+  [ "$2" = y ] && hint='[Y/n]'
+  printf '%s %s ' "$1" "$hint" >&2
+  IFS= read -r answer || hs_die "没有读到回答，已中止，什么都没有改。"
+  answer=$(hs_trim "$answer")
+  case ${answer,,} in
+    y | yes | 是 | 好 | 对 | 继续) return 0 ;;
+    n | no | 否 | 不 | 不要) return 1 ;;
+    '') [ "$2" = y ] ;;
+    *) hs_note '请回答 y 或 n。'; hs_confirm "$1" "$2" ;;
+  esac
+}
+
+hs_vmm_reachable() { local response; response=$(hs_http_get "${1%/}/v1/environments" 5) && [ "$(hs_http_status "$response")" = 200 ]; }
+
+# A vm_manager answering on this host's LAN address at its default port 8000, if any (the first-run default).
+hs_detect_vmm() {
+  local lan; lan=$(hs_detect_lan_ip)
+  if [ "$lan" != 127.0.0.1 ] && hs_vmm_reachable "http://$lan:8000"; then printf 'http://%s:8000' "$lan"; fi
+  return 0
+}
+
+hs_first_run() {
+  hs_interactive || hs_die "还没有配置（$HS_CONFIG_FILE 不存在）。请先在终端里运行一次 harnessstudio，回答几个问题。"
+  local key answer suggested
+  for key in "${!HS_ENV[@]}"; do printf -v "$key" '%s' "${HS_ENV[$key]}"; done
+  hs_say "第一次运行：回答几个问题（直接回车就用方括号里的默认值）。答案会存进 $HS_CONFIG_FILE，以后不再问。"
+  HS_INSTANCE=${HS_INSTANCE:-$HS_DEFAULT_INSTANCE}
+  while :; do
+    hs_ask answer '1. 网页端口' "${HS_PORT:-3080}"
+    [[ $answer =~ ^[0-9]{1,5}$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le 65535 ] && break
+    hs_note '   请输入 1–65535 之间的数字。'
+  done
+  HS_PORT=$answer
+  suggested=y; [ "${HS_BIND:-}" = 127.0.0.1 ] && suggested=n
+  if hs_confirm '2. 让局域网里的其他电脑也能访问吗？（n = 只能在本机访问）' "$suggested"; then HS_BIND=0.0.0.0; else HS_BIND=127.0.0.1; fi
+  suggested=${HS_PUBLIC_HOST:-$(hs_default HS_PUBLIC_HOST)}
+  while :; do
+    hs_ask answer '3. 别人在浏览器里访问用的地址（本机的局域网 IP 或主机名）' "$suggested"
+    [[ $answer =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && break
+    hs_note '   请输入 IP 地址或主机名，例如 192.168.1.20，不要带 http:// 和端口。'
+  done
+  HS_PUBLIC_HOST=$answer
+  local detected='' question hint
+  suggested=${HS_ENV[HS_VMM_URL]-}
+  if [ -z "${HS_ENV[HS_VMM_URL]+x}" ]; then detected=$(hs_detect_vmm); suggested=$detected; fi
+  # With a default address, Enter takes it, so "no VMs" needs its own answer; without one, Enter means no VMs.
+  if [ -n "$detected" ]; then
+    question='4. vm_manager 的地址（用来开 Windows 虚拟机）。回车 = 使用探测到的地址；输入 无（或 none、-）= 不用虚拟机'
+    hint='不用虚拟机就输入 无'
+  elif [ -n "$suggested" ]; then
+    question='4. vm_manager 的地址（用来开 Windows 虚拟机）。回车 = 使用方括号里的地址；输入 无（或 none、-）= 不用虚拟机'
+    hint='不用虚拟机就输入 无'
+  else
+    question='4. vm_manager 的地址（用来开 Windows 虚拟机；没有就直接回车，表示不用虚拟机）'
+    hint='不用虚拟机就直接回车'
+  fi
+  while :; do
+    hs_ask answer "$question" "$suggested"
+    answer=${answer%/}
+    case ${answer,,} in 无 | none | -) answer='' ;; esac
+    [ -z "$answer" ] && break
+    [[ $answer =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] && answer=http://$answer
+    if [[ $answer =~ ^https?://(127\.|localhost) ]]; then hs_note '   不能用 127.0.0.1 或 localhost：Studio 在容器里，那指的是容器自己。请填本机的局域网 IP，例如 http://192.168.1.20:8000'; continue; fi
+    [[ $answer =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] && break
+    hs_note "   地址要像 http://192.168.1.20:8000 这样；$hint。"
+  done
+  HS_VMM_URL=$answer
+  if [ -n "$HS_VMM_URL" ]; then
+    hs_vmm_reachable "$HS_VMM_URL" || hs_note "   现在连不上 $HS_VMM_URL；先照样记下，部署时会再检查并提示怎么启动。"
+    while :; do
+      hs_ask answer '5. vm_manager 的 projects 文件夹（vm_manager 数据目录下的 projects）' "${HS_VMM_PROJECTS_ROOT:-}" 必填
+      [[ $answer == /* ]] && [ -d "$answer" ] && break
+      if [ -z "$answer" ]; then hs_note '   这一项必填：请输入 vm_manager 数据目录下 projects 文件夹的绝对路径（必须已经存在）。'
+      else hs_note "   找不到文件夹 $answer，请输入已经存在的绝对路径。"
+      fi
+    done
+    HS_VMM_PROJECTS_ROOT=$answer
+  fi
+  while :; do
+    hs_ask answer '6. Agent 的 Linux 沙箱：auto = 装了 gVisor 就开，on = 必须开，off = 不开' "${HS_SANDBOX:-auto}"
+    [[ $answer =~ ^(auto|on|off)$ ]] && break
+    hs_note '   请输入 auto、on 或 off。'
+  done
+  HS_SANDBOX=$answer
+  if [ -z "${HS_SANDBOX_SUBNET:-}" ] && [ "$HS_INSTANCE" != "$HS_DEFAULT_INSTANCE" ]; then HS_SANDBOX_SUBNET=$(hs_free_sandbox_subnet); fi
+  hs_fill_defaults
+  hs_validate_config '这些设置'
+  hs_say ''
+  hs_say '将写入这些设置：'
+  hs_print_config
+  hs_confirm "写入 $HS_CONFIG_FILE？" y || hs_die '没有写入配置，什么都没有改。'
+  hs_write_config
+  hs_say "已写入 $HS_CONFIG_FILE。"
+}
+
+# ---------- adopting a deployment made by hand ----------
+
+# Settings of a running instance, read from its containers (docker inspect), so that it is adopted, not replaced.
+hs_derive_config() {
+  local studio=$1 line value bindings manager subnets
+  HS_PORT='' HS_BIND='' HS_PUBLIC_HOST='' HS_VMM_URL='' HS_VMM_PROJECTS_ROOT='' HS_SMOKE='' HS_ADOPT_BACKEND=mock HS_ADOPT_SANDBOX=0
+  bindings=$(hs_inspect "$studio" '{{range $port, $list := .HostConfig.PortBindings}}{{if eq $port "3080/tcp"}}{{range $list}}{{.HostIp}} {{.HostPort}}{{"\n"}}{{end}}{{end}}{{end}}')
+  read -r HS_BIND HS_PORT <<< "${bindings%%$'\n'*}" || true
+  if [ -z "$HS_PORT" ] && [[ $HS_BIND =~ ^[0-9]+$ ]]; then HS_PORT=$HS_BIND HS_BIND=0.0.0.0; fi
+  HS_BIND=${HS_BIND:-0.0.0.0}
+  while IFS= read -r line; do
+    value=${line#*=}
+    case $line in
+      STUDIO_PUBLIC_URL=*) [[ $value =~ ^https?://([^/:]+) ]] && HS_PUBLIC_HOST=${BASH_REMATCH[1]} ;;
+      STUDIO_SEAT_BACKEND=*) HS_ADOPT_BACKEND=$value ;;
+      STUDIO_VMM_URL=*) HS_VMM_URL=$value ;;
+      STUDIO_VMM_PROJECTS_ROOT=*) HS_VMM_PROJECTS_ROOT=$value ;;
+      STUDIO_SANDBOX_URL=*) HS_ADOPT_SANDBOX=1 ;;
+      STUDIO_SMOKE=1) HS_SMOKE=1 ;;
+    esac
+  done <<< "$(hs_inspect "$studio" '{{range .Config.Env}}{{println .}}{{end}}')"
+  [ "$HS_ADOPT_BACKEND" = vm-manager ] || HS_VMM_URL=''
+  [ -n "$HS_VMM_URL" ] || HS_VMM_PROJECTS_ROOT=''
+  HS_SANDBOX=off
+  manager=$(hs_container sandbox-manager)
+  if [ "$HS_ADOPT_SANDBOX" = 1 ] && [ -n "$manager" ]; then
+    HS_SANDBOX=auto
+    while IFS= read -r line; do
+      value=${line#*=}
+      case $line in
+        SANDBOX_NETWORK=*) HS_SANDBOX_NETWORK=$value ;;
+        SANDBOX_PROXY=*) [[ $value =~ ^http://([0-9.]+): ]] && HS_SANDBOX_PROXY_IP=${BASH_REMATCH[1]} ;;
+      esac
+    done <<< "$(hs_inspect "$manager" '{{range .Config.Env}}{{println .}}{{end}}')"
+    if [ -n "${HS_SANDBOX_NETWORK:-}" ]; then
+      subnets=$(docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}} {{.IPRange}}{{end}}' "$HS_SANDBOX_NETWORK" 2>/dev/null || true)
+      read -r HS_SANDBOX_SUBNET HS_SANDBOX_IP_RANGE <<< "$subnets" || true
+      [ -n "${HS_SANDBOX_SUBNET:-}" ] || unset HS_SANDBOX_SUBNET
+      [ -n "${HS_SANDBOX_IP_RANGE:-}" ] || unset HS_SANDBOX_IP_RANGE
+    fi
+  fi
+  [ -n "$HS_PUBLIC_HOST" ] || HS_PUBLIC_HOST=$(hs_default HS_PUBLIC_HOST)
+  [ -n "$HS_VMM_PROJECTS_ROOT" ] || unset HS_VMM_PROJECTS_ROOT
+  hs_fill_defaults
+}
+
+# Compose file secrets are bind mounts at /run/secrets/<name>; adoption must keep using the same files.
+hs_check_adopted_secrets() {
+  local container line source target directory mine problems=()
+  mine=$(cd -P "$HS_SECRETS_DIR" 2>/dev/null && pwd || printf '%s' "$HS_SECRETS_DIR")
+  for container in "$@"; do
+    [ -n "$container" ] || continue
+    while read -r source target; do
+      [[ $target == /run/secrets/* ]] || continue
+      directory=$(cd -P "$(dirname "$source")" 2>/dev/null && pwd || dirname "$source")
+      if [ "$directory" != "$mine" ]; then problems+=("$source（这份配置用的是 $HS_SECRETS_DIR）")
+      elif [ ! -f "$source" ]; then problems+=("$source 不存在")
+      fi
+    done <<< "$(hs_inspect "$container" '{{range .Mounts}}{{.Source}} {{.Destination}}{{println}}{{end}}')"
+  done
+  if [ ${#problems[@]} -gt 0 ]; then
+    hs_note '正在运行的容器用的密钥文件不在这份源码的密钥目录里，接管后会换成新的密钥：'
+    printf '  - %s\n' "${problems[@]}" >&2
+    hs_die "请先把原来的密钥文件复制到 $HS_SECRETS_DIR（保持文件名，权限 600），再运行 harnessstudio。什么都没有改。"
+  fi
+}
+
+hs_adopt() {
+  local studio=$1
+  hs_interactive || hs_die "本机已有在运行的实例 $HS_INSTANCE，但还没有配置文件（$HS_CONFIG_FILE）。请在终端里运行一次 harnessstudio，确认接管它。"
+  hs_derive_config "$studio"
+  if [ "$HS_ADOPT_BACKEND" != vm-manager ] && [ "$HS_ADOPT_BACKEND" != none ]; then
+    hs_note "本机的实例 $HS_INSTANCE 用的软件后端是「$(hs_backend_name "$HS_ADOPT_BACKEND")」（STUDIO_SEAT_BACKEND=$HS_ADOPT_BACKEND），它只用于开发。"
+    hs_note "harnessstudio 只部署「接 vm_manager」和「不接虚拟机」两种后端，它们的任务文件都不放在 $(hs_task_files_place "$HS_ADOPT_BACKEND")；接管后原有项目的任务文件在网页上会看不到，所以不能用 harnessstudio 接管这个实例。"
+    hs_note "这个实例请继续用原来的 compose 命令管理。要用 harnessstudio，另起一个实例，例如："
+    hs_note "  HARNESSSTUDIO_CONFIG=$HS_DEPLOY_DIR/<新实例名>.env HS_INSTANCE=<新实例名> harnessstudio"
+    hs_note "（第一次运行时回答问题；端口要和现有实例不同。）"
+    hs_die '没有接管，什么都没有改。'
+  fi
+  hs_validate_config "从运行中的容器推导出的设置"
+  hs_check_adopted_secrets "$studio" "$(hs_container sandbox-manager)"
+  hs_say "本机已有在运行的实例 $HS_INSTANCE（不是用 harnessstudio 部署的）。从它的容器推导出这些设置："
+  hs_print_config
+  [ "$HS_SANDBOX" = off ] && hs_say '  它没有开 Linux 沙箱，所以写成 HS_SANDBOX=off；想开就改成 auto。'
+  hs_say '接管只写配置文件，不会重建或重启任何容器；数据卷、密钥和虚拟机都保留。'
+  hs_confirm "写入 $HS_CONFIG_FILE 并接管？" y || hs_die '没有接管，什么都没有改。'
+  hs_write_config
+  hs_say "已写入 $HS_CONFIG_FILE。"
+}
+
+hs_load_or_create_config() {
+  if [ -f "$HS_CONFIG_FILE" ]; then hs_read_config; return; fi
+  HS_INSTANCE=${HS_ENV[HS_INSTANCE]:-$HS_DEFAULT_INSTANCE}
+  local studio; studio=$(hs_container studio)
+  if [ -n "$studio" ]; then hs_adopt "$studio"; else unset HS_INSTANCE; hs_first_run; fi
+  hs_read_config
+}
+
+# ---------- sandbox, vm_manager ----------
+
+hs_resolve_sandbox() {
+  HS_SANDBOX_ON=0 HS_SANDBOX_NOTE=''
+  case $HS_SANDBOX in
+    off) HS_SANDBOX_NOTE='Linux 沙箱：已关闭（HS_SANDBOX=off）。' ;;
+    on) hs_has_runsc || hs_die "配置要求开启 Linux 沙箱（HS_SANDBOX=on），但 Docker 里没有 gVisor 运行时 runsc。安装方法见 docs/sandbox.md 的「gVisor」，或者把 HS_SANDBOX 改成 auto。"
+      HS_SANDBOX_ON=1 ;;
+    auto) if hs_has_runsc; then HS_SANDBOX_ON=1
+      else HS_SANDBOX_NOTE='Linux 沙箱：没有开启，因为 Docker 里没有 gVisor 运行时 runsc。Agent 照常能用，只是不能在沙箱里运行命令；装好 gVisor（docs/sandbox.md）后再运行一次 harnessstudio 就会开启。'; fi ;;
+  esac
+  [ "$HS_SANDBOX_ON" = 1 ] && HS_SANDBOX_NOTE='Linux 沙箱：已开启。'
+  return 0
+}
+
+hs_check_vmm() {
+  HS_VMM_STATE=none HS_VMM_NOTE="虚拟机：没有接入 vm_manager（无软件模式）。这个实例部署之后就不能再改成接虚拟机：任务文件放的位置不同，换了以后原有项目的文件在网页上会看不到。
+  要用虚拟机，请另起一个实例，用另一个配置文件和不同的实例名（端口、沙箱网段也要不同），例如：
+    HARNESSSTUDIO_CONFIG=$HS_DEPLOY_DIR/<新实例名>.env HS_INSTANCE=<新实例名> harnessstudio
+  第一次运行时按提示填 vm_manager 的地址和 projects 文件夹。"
+  [ -n "$HS_VMM_URL" ] || return 0
+  [ -d "$HS_VMM_PROJECTS_ROOT" ] || hs_die "找不到 vm_manager 的 projects 文件夹 $HS_VMM_PROJECTS_ROOT。请检查配置里的 HS_VMM_PROJECTS_ROOT（$HS_CONFIG_FILE）。"
+  if [[ $HS_VMM_URL == https://* ]]; then
+    if command -v curl >/dev/null 2>&1 && curl --noproxy '*' -fsS -m 5 -o /dev/null "$HS_VMM_URL/v1/environments" 2>/dev/null; then HS_VMM_STATE=up; else HS_VMM_STATE=unknown; fi
+  elif hs_vmm_reachable "$HS_VMM_URL"; then HS_VMM_STATE=up
+  else HS_VMM_STATE=down
+  fi
+  case $HS_VMM_STATE in
+    up) HS_VMM_NOTE="虚拟机：已接入 vm_manager（$HS_VMM_URL）。" ;;
+    unknown) HS_VMM_NOTE="虚拟机：没法检查 $HS_VMM_URL（没有 curl），如果软件区打不开，请确认 vm_manager 在运行。" ;;
+    down)
+      local port=80
+      [[ $HS_VMM_URL =~ :([0-9]+)$ ]] && port=${BASH_REMATCH[1]}
+      HS_VMM_NOTE="虚拟机：vm_manager（$HS_VMM_URL）连不上。Studio 照常运行，只是暂时不能用虚拟机。
+  在 vm_manager 的源码目录里启动它（停止 vm_manager 不会停止虚拟机）：
+    1. sudo ss -ltnp 'sport = :$port'                 # 看端口上有没有旧进程，有就记下 pid
+    2. sudo kill -TERM <pid>                          # 只在有旧进程时执行
+    3. (setsid sudo env PYTHONDONTWRITEBYTECODE=1 \$PWD/.venv/bin/python \$PWD/main.py >> logs/vmm.log 2>&1 < /dev/null &)
+    4. curl -s http://127.0.0.1:$port/v1/environments  # 有返回就说明起来了
+  启动后不用重新部署 Studio，刷新网页即可。" ;;
+  esac
+  return 0
+}
+
+# ---------- versions, images, compose ----------
+
+# Design section 5: SHA-256 over `sha256sum` lines of the build inputs in byte order of their paths, first 12 digits.
+# Generated output (plugins/*/lib, apps/*/lib), node_modules and git-ignored file kinds are not inputs. No git needed.
+hs_version_inputs() {
+  cd "$HS_ROOT"
+  local dirs=() path
+  for path in scripts config plugins prompts deploy cli apps/*/src; do [ -d "$path" ] && dirs+=("$path"); done
+  # deploy/build-inputs.json is found with deploy/.
+  for path in Dockerfile package.json package-lock.json tsconfig.json; do [ -f "$path" ] && printf '%s\0' "$path"; done
+  find "${dirs[@]}" \( -name node_modules -o -name .studio -o -name .git \) -prune -o -type f -print0 | while IFS= read -r -d '' path; do
+    [[ $path =~ ^plugins/[^/]+/lib/ || $path == deploy/secrets/* ]] && continue
+    case ${path##*/} in
+      .DS_Store | .env | .env.* | .credentials.yaml | *.pem | *.key | *.p12 | *.pfx | *.tsbuildinfo | *.log) continue ;;
+    esac
+    printf '%s\0' "$path"
+  done
+}
+
+hs_source_version() {
+  local sum=(sha256sum)
+  command -v sha256sum >/dev/null 2>&1 || sum=(shasum -a 256)
+  (cd "$HS_ROOT" && hs_version_inputs | LC_ALL=C sort -z -u | xargs -0 "${sum[@]}" | "${sum[@]}") | cut -c1-12
+}
+
+hs_overlays() {
+  printf '%s\n' studio.yml
+  if [ -n "$HS_VMM_URL" ]; then printf '%s\n' vm-manager.yml; fi
+  if [ "$HS_SMOKE" = 1 ]; then printf '%s\n' smoke.yml; fi
+  if [ "${HS_SANDBOX_ON:-0}" = 1 ]; then
+    printf '%s\n' sandbox.yml
+    if [ -n "$HS_VMM_URL" ]; then printf '%s\n' sandbox-vm-manager.yml; else printf '%s\n' sandbox-none.yml; fi
+  fi
+}
+
+hs_services() {
+  printf '%s\n' studio
+  if [ "${HS_SANDBOX_ON:-0}" = 1 ]; then printf '%s\n' sandbox-manager sandbox-egress; fi
+}
+
+# What the studio container's label records; a change means the container has to be recreated.
+hs_config_digest() {
+  {
+    printf '%s\n' "instance=$HS_INSTANCE" "port=$HS_PORT" "bind=$HS_BIND" "host=$HS_PUBLIC_HOST" "vmm=$HS_VMM_URL" "smoke=$HS_SMOKE" "sandbox=${HS_SANDBOX_ON:-0}"
+    if [ -n "$HS_VMM_URL" ]; then printf '%s\n' "projects=$HS_VMM_PROJECTS_ROOT"; fi
+    if [ "${HS_SANDBOX_ON:-0}" = 1 ]; then printf '%s\n' "network=$HS_SANDBOX_NETWORK $HS_SANDBOX_SUBNET $HS_SANDBOX_IP_RANGE $HS_SANDBOX_PROXY_IP"; fi
+  } | sha256sum | cut -c1-12
+}
+
+hs_compose() {
+  local files=() file
+  while IFS= read -r file; do files+=(-f "$HS_COMPOSE_DIR/$file"); done < <(hs_overlays)
+  env -u COMPOSE_FILE -u COMPOSE_PROFILES -u COMPOSE_PROJECT_NAME -u COMPOSE_ENV_FILES \
+    HS_INSTANCE="$HS_INSTANCE" HS_PORT="$HS_PORT" HS_BIND="$HS_BIND" HS_PUBLIC_HOST="$HS_PUBLIC_HOST" \
+    HS_VMM_URL="$HS_VMM_URL" HS_VMM_PROJECTS_ROOT="$HS_VMM_PROJECTS_ROOT" HS_SANDBOX_NETWORK="$HS_SANDBOX_NETWORK" \
+    HS_SANDBOX_SUBNET="$HS_SANDBOX_SUBNET" HS_SANDBOX_IP_RANGE="$HS_SANDBOX_IP_RANGE" HS_SANDBOX_PROXY_IP="$HS_SANDBOX_PROXY_IP" \
+    HS_TAG="${HS_TAG:-unset}" HS_SANDBOX_TAG="${HS_SANDBOX_TAG:-${HS_TAG:-unset}}" HS_SECRETS_DIR="$HS_SECRETS_DIR" \
+    HS_CONFIG_DIGEST="${HS_CONFIG_DIGEST:-unset}" \
+    docker compose -p "$HS_INSTANCE" --project-directory "$HS_COMPOSE_DIR" "${files[@]}" "$@"
+}
+
+hs_build() { # target name tag
+  local extra=() key
+  hs_require_buildx
+  # The sandbox image is apt and pip heavy: it is built on the host network so that a proxy on this host (the
+  # shell's HTTP(S)_PROXY) can be used, as docs/sandbox.md always did. The network mode is part of BuildKit's cache key
+  # (that is what keeps earlier builds' layers usable); the predefined proxy build args are not. The other images keep
+  # the default network: their cached layers were built that way.
+  if [ "$1" = sandbox ]; then
+    extra=(--network host)
+    for key in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+      if [ -n "${!key:-}" ]; then extra+=(--build-arg "$key=${!key}"); fi
+    done
+  fi
+  hs_say "构建镜像 harnessstudio/$2:$3（第一次构建要几十分钟，以后只重新构建改过的部分）……"
+  docker build --target "$1" ${extra[@]+"${extra[@]}"} --build-arg "HARNESSSTUDIO_VERSION=$HS_VERSION" -t "harnessstudio/$2:$3" "$HS_ROOT"
+}
+
+# Builds the images of this source version that do not exist yet; a rollback tag (HARNESSSTUDIO_TAG) is never built.
+hs_build_images() {
+  if [ "$HS_TAG" = "$HS_VERSION" ] && [ -z "$(hs_image_id "harnessstudio/studio:$HS_TAG")" ]; then hs_build studio studio "$HS_TAG"; fi
+  if [ "$HS_SANDBOX_ON" = 1 ] && [ "$HS_SANDBOX_TAG" = "$HS_VERSION" ]; then
+    local name
+    for name in sandbox-manager sandbox-egress sandbox; do
+      if [ -z "$(hs_image_id "harnessstudio/$name:$HS_VERSION")" ]; then hs_build "$name" "$name" "$HS_VERSION"; fi
+    done
+  fi
+  return 0
+}
+
+hs_secret_valid() { [[ $(cat "$1") =~ ^[A-Za-z0-9_-]{$2,128}$'\n'?$ ]]; }
+
+# .studio/deploy/secrets: kept when present, else generated with /dev/urandom (no Node on the host). Never printed.
+hs_ensure_secrets() {
+  local name minimum file
+  mkdir -p "$HS_SECRETS_DIR"
+  chmod 700 "$HS_SECRETS_DIR"
+  for name in mock-seat-token:40 sandbox-token:32; do
+    minimum=${name#*:} file=$HS_SECRETS_DIR/${name%%:*}
+    if [ -e "$file" ] || [ -L "$file" ]; then
+      [ -f "$file" ] && [ ! -L "$file" ] || hs_die "$file 不是普通文件，请检查。"
+      hs_secret_valid "$file" "$minimum" || hs_die "$file 的内容不是有效的密钥（$minimum–128 个字母、数字、- 或 _）。请检查或删除它，删除后会重新生成。"
+    else
+      (umask 077 && set -C && head -c 48 /dev/urandom | base64 | tr -d '\n=' | tr '+/' '-_' > "$file" && echo >> "$file")
+    fi
+    chmod 600 "$file"
+  done
+  file=$HS_SECRETS_DIR/provider.env
+  if [ ! -e "$file" ]; then
+    (umask 077 && set -C && printf '%s\n' '# 可选：模型服务的环境变量（例如 DEEPSEEK_API_KEY=...）。一般直接在网页「模型配置」里填密钥即可。' > "$file")
+  fi
+  chmod 600 "$file"
+}
+
+# Unfinished autonomy runs (design section 5); '?' when Studio does not answer.
+hs_unfinished_runs() {
+  local response count=0 state rest
+  response=$(hs_http_get "$(hs_local_url)api/studio/autonomy/runs" 5 "$HS_PUBLIC_HOST:$HS_PORT") || { printf '?'; return; }
+  [ "$(hs_http_status "$response")" = 200 ] || { printf '?'; return; }
+  for state in running paused waiting-human blocked; do
+    rest=$response
+    while [[ $rest == *"\"state\":\"$state\""* ]]; do count=$((count + 1)); rest=${rest#*"\"state\":\"$state\""}; done
+  done
+  printf '%s' "$count"
+}
+
+hs_local_url() {
+  local host=$HS_BIND
+  [ "$host" = 0.0.0.0 ] && host=127.0.0.1
+  printf 'http://%s:%s/' "$host" "$HS_PORT"
+}
+
+hs_public_url() { printf 'http://%s:%s/' "$HS_PUBLIC_HOST" "$HS_PORT"; }
+
+hs_config_prefix() {
+  if [ -n "${HARNESSSTUDIO_CONFIG:-}" ]; then printf 'HARNESSSTUDIO_CONFIG=%q ' "$HS_CONFIG_FILE"; fi
+}
+
+# A mkdir lock per instance: two commands must not deploy the same instance at once. A dead holder's lock is taken over.
+hs_lock() {
+  local lock=$HS_DEPLOY_DIR/.lock-$HS_INSTANCE holder
+  mkdir -p "$HS_DEPLOY_DIR"
+  until mkdir "$lock" 2>/dev/null; do
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then hs_die "另一个 harnessstudio（进程 $holder）正在部署实例 $HS_INSTANCE，请等它结束。"; fi
+    rm -rf "$lock"
+  done
+  echo $$ > "$lock/pid"
+  HS_LOCK=$lock
+  trap 'rm -rf "$HS_LOCK"' EXIT
+}
+
+# Tags what runs now as harnessstudio/<image>:rollback-<time>, so one line brings it back (docs/deploy-cli.md).
+hs_tag_rollback() {
+  local stamp service container image sandbox_image
+  stamp=rollback-$(date +%Y%m%d-%H%M%S)
+  # Never move an existing rollback tag: two deployments within one second (a rollback right after an update) would
+  # otherwise re-point the very tag being rolled back to.
+  local base=$stamp n=1
+  while [ -n "$(hs_image_id "harnessstudio/studio:$stamp")" ]; do n=$((n + 1)); stamp=$base-$n; done
+  for service in studio sandbox-manager sandbox-egress; do
+    container=$(hs_container "$service")
+    [ -n "$container" ] || continue
+    image=$(hs_inspect "$container" '{{.Image}}')
+    [ -n "$image" ] && docker tag "$image" "harnessstudio/$service:$stamp"
+    if [ "$service" = sandbox-manager ]; then
+      while IFS= read -r sandbox_image; do
+        if [[ $sandbox_image == SANDBOX_IMAGE=* ]]; then docker tag "${sandbox_image#SANDBOX_IMAGE=}" "harnessstudio/sandbox:$stamp" 2>/dev/null || true; fi
+      done <<< "$(hs_inspect "$container" '{{range .Config.Env}}{{println .}}{{end}}')"
+    fi
+  done
+  printf '%s' "$stamp"
+}
+
+hs_record() {
+  mkdir -p "$HS_DEPLOY_DIR"
+  printf '%s instance=%s from=%s to=%s rollback=%s config=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$HS_INSTANCE" "$1" "$HS_TAG" "${2:--}" "$HS_CONFIG_FILE" >> "$HS_HISTORY"
+}
+
+hs_print_status() {
+  hs_say "  网址：$(hs_public_url)"
+  if [ "$HS_BIND" = 127.0.0.1 ]; then hs_say '  只能在本机访问（HS_BIND=127.0.0.1）。'; else hs_say '  局域网里的其他电脑用这个网址访问。'; fi
+  hs_say "  $HS_VMM_NOTE"
+  hs_say "  $HS_SANDBOX_NOTE"
+  hs_say "  停止：$(hs_config_prefix)harnessstudio stop"
+}
+
+# ---------- software backend of an existing instance ----------
+
+hs_backend_name() {
+  case $1 in
+    vm-manager) printf '接 vm_manager（虚拟机）' ;;
+    none) printf '不接虚拟机（无软件模式）' ;;
+    mock) printf 'Mock 软件平台' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Where each backend keeps task files (contract section 10, ④): Studio shows only those of its current backend.
+hs_task_files_place() { # backend [projects root]
+  case $1 in
+    vm-manager) printf 'vm_manager 的 projects 目录（%s）' "${2:-未知}" ;;
+    none) printf 'Studio 数据卷里的 studio/files' ;;
+    mock) printf 'Studio 数据卷里的 studio/workspaces' ;;
+    *) printf '后端 %s 自己的位置' "$1" ;;
+  esac
+}
+
+# Switching an existing instance's backend would hide its projects' task files, and there is no migration: refuse,
+# say why and what to do. The last backend is the studio container's STUDIO_SEAT_BACKEND (compose's default was mock).
+hs_check_backend() {
+  local line last='' projects='' url='' wanted=none
+  while IFS= read -r line; do
+    case $line in
+      STUDIO_SEAT_BACKEND=*) last=${line#*=} ;;
+      STUDIO_VMM_PROJECTS_ROOT=*) projects=${line#*=} ;;
+      STUDIO_VMM_URL=*) url=${line#*=} ;;
+    esac
+  done <<< "$(hs_inspect "$1" '{{range .Config.Env}}{{println .}}{{end}}')"
+  last=${last:-mock}
+  [ -n "$HS_VMM_URL" ] && wanted=vm-manager
+  [ "$last" = "$wanted" ] && return 0
+  hs_note "实例 $HS_INSTANCE 上次运行的软件后端是「$(hs_backend_name "$last")」，任务文件在 $(hs_task_files_place "$last" "$projects")；"
+  hs_note "而配置（$HS_CONFIG_FILE）里是「$(hs_backend_name "$wanted")」，任务文件会放在 $(hs_task_files_place "$wanted" "$HS_VMM_PROJECTS_ROOT")。"
+  hs_note '换了后端，原有项目的任务文件在网页上会看不到（文件还在原处，harnessstudio 不做自动迁移），所以没有部署，什么都没有改。'
+  hs_note '怎么办：'
+  case $last in
+    vm-manager) hs_note "  - 继续用虚拟机：在配置里填回 HS_VMM_URL=${url:-<原来的 vm_manager 地址>}${projects:+ 和 HS_VMM_PROJECTS_ROOT=$projects}，再运行 harnessstudio。" ;;
+    none) hs_note '  - 继续不接虚拟机：把配置里的 HS_VMM_URL 清空，再运行 harnessstudio。' ;;
+    *) hs_note "  - 这个实例用的是「$(hs_backend_name "$last")」（只用于开发），harnessstudio 不部署它；请继续用原来的 compose 命令管理。" ;;
+  esac
+  hs_note '  - 想用新的后端：另起一个实例，用另一个配置文件和不同的实例名（端口、沙箱网段也要不同），例如：'
+  hs_note "      HARNESSSTUDIO_CONFIG=$HS_DEPLOY_DIR/<新实例名>.env HS_INSTANCE=<新实例名> harnessstudio"
+  exit 1
+}
+
+# ---------- harnessstudio ----------
+
+# $1 = run: the batch command needs a running Studio; it never replaces one that is running.
+hs_deploy() {
+  local purpose=${1:-}
+  hs_require_docker
+  hs_load_or_create_config
+  hs_resolve_sandbox
+  hs_check_vmm
+  HS_VERSION=$(hs_source_version)
+  HS_TAG=${HARNESSSTUDIO_TAG:-$HS_VERSION}
+  HS_SANDBOX_TAG=$HS_TAG
+  if [ -n "${HARNESSSTUDIO_TAG:-}" ]; then
+    [[ $HS_TAG =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || hs_die "HARNESSSTUDIO_TAG 不是有效的镜像标签：$HS_TAG"
+    [ -n "$(hs_image_id "harnessstudio/studio:$HS_TAG")" ] || hs_die "找不到镜像 harnessstudio/studio:$HS_TAG。可以回滚到的标签见 $HS_HISTORY，或 docker images harnessstudio/studio。"
+    if [ "$HS_SANDBOX_ON" = 1 ] && { [ -z "$(hs_image_id "harnessstudio/sandbox-manager:$HS_TAG")" ] || [ -z "$(hs_image_id "harnessstudio/sandbox-egress:$HS_TAG")" ] || [ -z "$(hs_image_id "harnessstudio/sandbox:$HS_TAG")" ]; }; then
+      hs_note "注意：$HS_TAG 没有沙箱镜像，沙箱部分改用当前源码的版本 $HS_VERSION。"
+      HS_SANDBOX_TAG=$HS_VERSION
+    fi
+  fi
+  HS_CONFIG_DIGEST=$(hs_config_digest)
+
+  local studio state='' running_version='' running_digest='' running_image='' target_image same_image=0 reasons=() service orphans=() missing=0 line container wanted
+  studio=$(hs_container studio)
+  if [ -n "$studio" ]; then
+    state=$(hs_inspect "$studio" '{{.State.Status}}')
+    running_version=$(hs_label "$studio" org.harnessstudio.version)
+    running_digest=$(hs_label "$studio" org.harnessstudio.config)
+    running_image=$(hs_inspect "$studio" '{{.Image}}')
+  fi
+  target_image=$(hs_image_id "harnessstudio/studio:$HS_TAG")
+  if [ -n "$running_image" ] && [ "$running_image" = "$target_image" ]; then same_image=1
+  elif [ -z "${HARNESSSTUDIO_TAG:-}" ] && [ -n "$running_version" ] && [ "$running_version" = "$HS_VERSION" ]; then same_image=1
+  fi
+  [ "$same_image" = 1 ] || reasons+=(version)
+  [ "$running_digest" = "$HS_CONFIG_DIGEST" ] || reasons+=(config)
+  # Containers of this instance that the current configuration no longer has (for example Mock Seat, or the sandbox
+  # services after HS_SANDBOX=off); compose removes them with --remove-orphans.
+  wanted=" $(hs_services | tr '\n' ' ') "
+  while IFS=' ' read -r service line; do
+    [ -n "$service" ] || continue
+    [[ $wanted == *" $service "* ]] || orphans+=("$line")
+  done <<< "$(docker ps -a --filter "label=com.docker.compose.project=$HS_INSTANCE" --format '{{.Label "com.docker.compose.service"}} {{.Names}}')"
+  for service in $wanted; do
+    container=$(hs_container "$service")
+    if [ -z "$container" ] || [ "$(hs_inspect "$container" '{{.State.Status}}')" != running ]; then missing=1; fi
+  done
+
+  # Nothing is deployed when Studio already runs as configured, or when `run` only connects to the Studio that runs.
+  if [ -n "$studio" ] && ! { [ "$state" = running ] && { [ "$purpose" = run ] || { [ ${#reasons[@]} -eq 0 ] && [ "$missing" = 0 ] && [ ${#orphans[@]} -eq 0 ]; }; }; }; then
+    hs_check_backend "$studio"
+  fi
+
+  if [ "$state" = running ]; then
+    if [ ${#reasons[@]} -eq 0 ] && [ "$missing" = 0 ] && [ ${#orphans[@]} -eq 0 ]; then
+      hs_say "HarnessStudio 已在运行（实例 $HS_INSTANCE，版本 ${running_version:-$HS_TAG}），没有需要更新的内容。"
+      hs_print_status
+      return 0
+    fi
+    if [ "$purpose" = run ] && [ ${#reasons[@]} -eq 0 ]; then
+      hs_note "注意：Studio 在运行，但有的服务没在运行或有多余的容器；批量命令不改动它们，需要时运行 $(hs_config_prefix)harnessstudio。"
+      return 0
+    fi
+    if [ ${#reasons[@]} -gt 0 ]; then
+      local what=''
+      [[ " ${reasons[*]} " == *' version '* ]] && what="检测到代码有更新：运行中的版本是 ${running_version:-未知（不是用 harnessstudio 部署的）}，要部署的是 $HS_TAG。"
+      [ -n "${HARNESSSTUDIO_TAG:-}" ] && [[ " ${reasons[*]} " == *' version '* ]] && what="将切换到 $HS_TAG（运行中的版本是 ${running_version:-未知}）。"
+      if [[ " ${reasons[*]} " == *' config '* ]]; then
+        if [ -n "$running_digest" ]; then what+="${what:+ }配置有变化（$HS_CONFIG_FILE），需要重建容器才能生效。"
+        else what+="${what:+ }运行中的容器不是按这份配置部署的，需要重建容器。"
+        fi
+      fi
+      if [ "$purpose" = run ]; then
+        hs_note "注意：$what Studio 正在运行，批量命令不会重新部署它；需要时先运行 $(hs_config_prefix)harnessstudio。"
+        return 0
+      fi
+      hs_say "$what"
+      if ! hs_interactive; then
+        hs_say "Studio 继续运行旧版本。要更新，请在终端里运行 $(hs_config_prefix)harnessstudio 并确认。"
+        hs_print_status
+        return 0
+      fi
+      hs_say "重新部署会让正在进行的自主运行暂停（之后在运行面板上点「继续」）。未结束的自主运行：$(hs_unfinished_runs) 个。"
+      [ ${#orphans[@]} -gt 0 ] && hs_say "同时会移除不再需要的容器（数据卷保留）：${orphans[*]}"
+      hs_confirm '是否继续？' n || { hs_say '没有重新部署，Studio 继续运行原来的版本。'; hs_print_status; return 0; }
+    fi
+  fi
+
+  # A stopped instance keeps the version it last ran: after a rollback and a stop, a plain `harnessstudio` must not
+  # quietly move it to the current source. Changing it needs a yes in a terminal, as for a running instance.
+  if [ -n "$studio" ] && [ "$state" != running ] && [ "$same_image" = 0 ]; then
+    local previous; previous=$(hs_previous_version "$studio" "$running_version")
+    hs_say "实例 $HS_INSTANCE 现在没在运行。上次运行的是 $previous，现在要部署 $HS_TAG。"
+    if ! hs_interactive; then
+      hs_say "不在终端里，不改版本，按上次的版本启动。要部署 $HS_TAG，请在终端里运行 $(hs_config_prefix)${HARNESSSTUDIO_TAG:+HARNESSSTUDIO_TAG=$HARNESSSTUDIO_TAG }harnessstudio 并确认。"
+      hs_start_previous "$studio" "$previous" "${reasons[*]}"
+      return 0
+    fi
+    if ! hs_confirm "部署 $HS_TAG 吗？（n = 按上次的版本启动）" n; then
+      hs_start_previous "$studio" "$previous" "${reasons[*]}"
+      return 0
+    fi
+  fi
+
+  hs_guard '改动它的容器'
+  hs_lock
+  local probe=$HS_BIND
+  [ "$probe" = 0.0.0.0 ] && probe=127.0.0.1
+  if [ "$state" != running ] && hs_port_busy "$probe" "$HS_PORT"; then
+    hs_die "端口 $HS_PORT 已经被别的程序占用。查是谁：sudo ss -ltnp 'sport = :$HS_PORT'；或者把 $HS_CONFIG_FILE 里的 HS_PORT 改成别的数字。"
+  fi
+  hs_ensure_secrets
+  hs_build_images
+
+  local rollback=''
+  if [ -n "$studio" ] && [ "$same_image" = 0 ]; then rollback=$(hs_tag_rollback); fi
+  local from=-
+  if [ -n "$running_version" ]; then from=$running_version; elif [ -n "$running_image" ]; then from=unknown:${running_image#sha256:}; from=${from:0:20}; fi
+  hs_record "$from" "$rollback"
+  [ ${#orphans[@]} -gt 0 ] && hs_say "移除不再需要的容器（数据卷保留）：${orphans[*]}"
+  hs_say "启动实例 $HS_INSTANCE（版本 $HS_TAG）……"
+  if ! hs_compose up -d --wait --wait-timeout 600 --remove-orphans; then
+    hs_note "启动失败。查看日志：docker logs ${HS_INSTANCE}-studio-1"
+    [ -n "$rollback" ] && hs_note "回到部署前的版本：$(hs_config_prefix)HARNESSSTUDIO_TAG=$rollback harnessstudio"
+    exit 1
+  fi
+  local response='' tries
+  # up --wait already waited for the health check; this confirms the published port from the host.
+  for tries in 1 2 3; do
+    response=$(hs_http_get "$(hs_local_url)" 5 "$HS_PUBLIC_HOST:$HS_PORT" || true)
+    [ "$(hs_http_status "$response")" = 200 ] && break
+    sleep 1
+  done
+  [ "$(hs_http_status "$response")" = 200 ] || hs_note "注意：容器已启动，但 $(hs_local_url) 没有正常响应，请看 docker logs ${HS_INSTANCE}-studio-1。"
+  hs_say "HarnessStudio 已启动（实例 $HS_INSTANCE，版本 $HS_TAG）。"
+  hs_print_status
+  if [ -n "$rollback" ]; then hs_say "  回滚到部署前的版本：$(hs_config_prefix)HARNESSSTUDIO_TAG=$rollback harnessstudio"
+  elif [ -z "$studio" ]; then hs_say '  这是第一次部署，没有可回滚的旧版本。'
+  fi
+}
+
+# ---------- harnessstudio stop ----------
+
+# What a stopped studio container last ran: its version label, and the image tag when that tells more (a rollback tag).
+hs_previous_version() {
+  local image tag
+  image=$(hs_inspect "$1" '{{.Config.Image}}')
+  tag=''
+  [[ $image == *:* ]] && tag=${image##*:}
+  if [ -n "$2" ] && [ -n "$tag" ] && [ "$tag" != "$2" ]; then printf '%s（镜像标签 %s）' "$2" "$tag"
+  elif [ -n "$2" ]; then printf '%s' "$2"
+  elif [ -n "$tag" ]; then printf '%s' "$tag"
+  else printf '未知'
+  fi
+}
+
+# Starts the instance's existing containers exactly as they were: the version and settings of their last run.
+hs_start_previous() { # studio container, previous version text, reasons
+  local ids status tries
+  hs_guard '启动它'
+  hs_lock
+  ids=$(docker ps -aq --filter "label=com.docker.compose.project=$HS_INSTANCE")
+  [ -n "$ids" ] || hs_die "找不到实例 $HS_INSTANCE 的容器。"
+  hs_say "按上次的版本启动实例 $HS_INSTANCE……"
+  # shellcheck disable=SC2086 # one argument per container ID
+  docker start $ids >/dev/null || hs_die "启动失败。查看日志：docker logs ${HS_INSTANCE}-studio-1"
+  for tries in $(seq 1 150); do
+    status=$(hs_inspect "$1" '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}')
+    [ "$status" = starting ] || break
+    sleep 2
+  done
+  [ "$status" = healthy ] || [ "$status" = running ] || hs_note "注意：容器已启动，但健康检查是 ${status:-未知}，请看 docker logs ${HS_INSTANCE}-studio-1。"
+  hs_say "HarnessStudio 已启动（实例 $HS_INSTANCE，上次的版本 $2）。"
+  hs_print_status
+  [[ " $3 " == *' config '* ]] && hs_say '  配置文件的改动要等部署新版本时才生效。'
+  hs_say "  部署当前源码的版本 $HS_TAG：在终端里运行 $(hs_config_prefix)${HARNESSSTUDIO_TAG:+HARNESSSTUDIO_TAG=$HARNESSSTUDIO_TAG }harnessstudio 并确认。"
+}
+
+hs_stop() {
+  hs_require_docker
+  [ -f "$HS_CONFIG_FILE" ] || hs_die "还没有配置（$HS_CONFIG_FILE 不存在），没有可停止的实例。"
+  hs_read_config
+  hs_guard '停止它'
+  local service container stopped=() sandboxes
+  for service in studio sandbox-manager sandbox-egress; do
+    container=$(hs_container "$service")
+    [ -n "$container" ] && [ "$(hs_inspect "$container" '{{.State.Status}}')" = running ] || continue
+    docker stop --time 30 "$container" >/dev/null
+    stopped+=("$service")
+  done
+  # Sandboxes of this instance only: those on its own sandbox network.
+  sandboxes=$(docker ps -q --filter label=harnessstudio.sandbox=1 --filter "network=$HS_SANDBOX_NETWORK" 2>/dev/null || true)
+  if [ -n "$sandboxes" ]; then
+    # shellcheck disable=SC2086 # one argument per container ID
+    docker stop --time 5 $sandboxes >/dev/null
+    stopped+=("$(wc -w <<< "$sandboxes" | tr -d ' ') 个 Agent 沙箱")
+  fi
+  if [ ${#stopped[@]} -eq 0 ]; then hs_say "实例 $HS_INSTANCE 本来就没有在运行。"
+  else hs_say "已停止实例 $HS_INSTANCE：${stopped[*]}。"
+  fi
+  hs_say '虚拟机不受影响（由 vm_manager 管理）；项目、对话和文件都保留。再次启动：'"$(hs_config_prefix)"'harnessstudio'
+}
+
+# ---------- harnessstudio run ----------
+
+hs_run() {
+  local args=("$@") url='' manifest='' help=0 index=0 value
+  [ -d "$HS_ROOT/cli" ] || hs_die "批量命令尚未安装：这份源码里没有 cli/ 文件夹。"
+  while [ $index -lt ${#args[@]} ]; do
+    value=${args[$index]}
+    case $value in
+      -h | --help) help=1 ;;
+      --url) index=$((index + 1)); url=${args[$index]:-} ;;
+      --url=*) url=${value#--url=} ;;
+      --parallel | --out | --resume) index=$((index + 1)) ;;
+      -*) ;;
+      *) [ -z "$manifest" ] && manifest=$value ;;
+    esac
+    index=$((index + 1))
+  done
+  hs_require_docker
+  local public=''
+  if [ "$help" = 1 ]; then url=${url:-http://127.0.0.1:3080/}
+  elif [ -n "$url" ]; then
+    [[ $url =~ ^https?://[^/]+/?$ ]] || hs_die "--url 要像 http://192.168.1.20:3080 这样：$url"
+    url=${url%/}/
+    if [[ $url == http://* ]]; then
+      local response; response=$(hs_http_get "${url}api/studio/projects" 10) || true
+      [ "$(hs_http_status "$response")" = 200 ] || hs_die "连不上 $url 上的 HarnessStudio（--url 只连接，不会部署）。"
+    fi
+    public=$url
+  else
+    hs_deploy run
+    url=$(hs_local_url) public=$(hs_public_url)
+  fi
+  HS_VERSION=$(hs_source_version)
+  local image=harnessstudio/cli:$HS_VERSION
+  if [ -z "$(hs_image_id "$image")" ]; then hs_build cli cli "$HS_VERSION"; fi
+  local run=(docker run --rm --init --network host --user "$(id -u):$(id -g)" -v "$PWD:$PWD" -w "$PWD")
+  if [ -t 0 ] && [ -t 1 ]; then run+=(-it); fi
+  if [ -n "$manifest" ] && [ -e "$manifest" ]; then
+    local directory; directory=$(cd -P "$(dirname "$manifest")" && pwd)
+    local here; here=$(pwd -P)
+    if [ "$directory" != "$here" ] && [[ $directory != "$here"/* ]]; then run+=(-v "$directory:$directory:ro"); fi
+  fi
+  # The container runs in UTC otherwise; project names and the default output folder carry the local time.
+  if [ -e /etc/localtime ]; then run+=(-v /etc/localtime:/etc/localtime:ro); fi
+  run+=(-e "HARNESSSTUDIO_URL=$url")
+  [ -n "$public" ] && run+=(-e "HARNESSSTUDIO_PUBLIC_URL=$public")
+  # exec: docker becomes the foreground process, so Ctrl+C reaches the client (through the TTY, or --sig-proxy).
+  trap - ERR
+  exec "${run[@]}" "$image" run "$@"
+}
+
+hs_main() {
+  case ${1:-} in
+    '') hs_deploy ;;
+    stop) [ $# -eq 1 ] || hs_die 'stop 不接受参数。'; hs_stop ;;
+    run) shift; hs_run "$@" ;;
+    -h | --help) hs_help ;;
+    *) hs_die "不认识的命令：$1。用 harnessstudio --help 查看用法。" ;;
+  esac
+}
+
+# bash reads a script while it runs: exiting inside this one compound command means a source update during a long
+# build (git pull, a new package unpacked over this one) cannot make bash read the rest of a changed file.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then hs_main "$@"; exit $?; fi

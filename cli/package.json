@@ -1,0 +1,16 @@
+{
+  "name": "harnessstudio-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "harnessstudio run: batch task client. Talks to Studio over HTTP only.",
+  "bin": {
+    "harnessstudio-run": "./bin/harnessstudio.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
+  }
+}

@@ -1,0 +1,144 @@
+{
+  "name": "@harnessstudio/studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./browser-access": {
+      "types": "./src/browser-access.ts",
+      "default": "./lib/browser-access.js"
+    },
+    "./engineering-context": {
+      "types": "./src/engineering-context.ts",
+      "default": "./lib/engineering-context.js"
+    },
+    "./seat": {
+      "types": "./src/seat.ts",
+      "default": "./lib/seat.js"
+    },
+    "./seat-types": {
+      "types": "./src/seat-types.ts",
+      "default": "./lib/seat-types.js"
+    },
+    "./vm-seat": {
+      "types": "./src/vm-seat.ts",
+      "default": "./lib/vm-seat.js"
+    },
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./lib/index.js"
+    },
+    "./workspace": "./lib/workspace.js",
+    "./models": {
+      "types": "./src/models.ts",
+      "default": "./lib/models.js"
+    },
+    "./domain": {
+      "types": "./src/domain.ts",
+      "default": "./lib/domain.js"
+    },
+    "./domain-types": {
+      "types": "./src/domain-types.ts",
+      "default": "./lib/domain-types.js"
+    },
+    "./chat-types": {
+      "types": "./src/chat-types.ts",
+      "default": "./lib/chat-types.js"
+    },
+    "./chat-audit": {
+      "types": "./src/chat-audit.ts",
+      "default": "./lib/chat-audit.js"
+    },
+    "./chat-audit-types": {
+      "types": "./src/chat-audit-types.ts",
+      "default": "./lib/chat-audit-types.js"
+    },
+    "./web": {
+      "types": "./src/web.ts",
+      "default": "./lib/web.js"
+    },
+    "./web-fetch": {
+      "types": "./src/web-fetch.ts",
+      "default": "./lib/web-fetch.js"
+    },
+    "./network": {
+      "types": "./src/network.ts",
+      "default": "./lib/network.js"
+    },
+    "./planning": {
+      "types": "./src/planning.ts",
+      "default": "./lib/planning.js"
+    },
+    "./todo": {
+      "types": "./src/todo.ts",
+      "default": "./lib/todo.js"
+    },
+    "./questions": {
+      "types": "./src/questions.ts",
+      "default": "./lib/questions.js"
+    },
+    "./questions-types": {
+      "types": "./src/questions-types.ts",
+      "default": "./lib/questions-types.js"
+    },
+    "./questions-validation": {
+      "types": "./src/questions-validation.ts",
+      "default": "./lib/questions-validation.js"
+    },
+    "./prompt-loader": {
+      "types": "./src/prompt-loader.ts",
+      "default": "./lib/prompt-loader.js"
+    },
+    "./chat-attachment-types": {
+      "types": "./src/chat-attachment-types.ts",
+      "default": "./lib/chat-attachment-types.js"
+    },
+    "./chat-attachments": {
+      "types": "./src/chat-attachments.ts",
+      "default": "./lib/chat-attachments.js"
+    },
+    "./browser-reader": {
+      "types": "./src/browser-reader.ts",
+      "default": "./lib/browser-reader.js"
+    },
+    "./chat-debug": {
+      "types": "./src/chat-debug.ts",
+      "default": "./lib/chat-debug.js"
+    },
+    "./skills": {
+      "types": "./src/skills.ts",
+      "default": "./lib/skills.js"
+    },
+    "./mcp": {
+      "types": "./src/mcp.ts",
+      "default": "./lib/mcp.js"
+    },
+    "./plugins": {
+      "types": "./src/plugins.ts",
+      "default": "./lib/plugins.js"
+    },
+    "./sandbox": {
+      "types": "./src/sandbox.ts",
+      "default": "./lib/sandbox.js"
+    },
+    "./autonomy": {
+      "types": "./src/autonomy.ts",
+      "default": "./lib/autonomy.js"
+    },
+    "./autonomy-types": {
+      "types": "./src/autonomy-types.ts",
+      "default": "./lib/autonomy-types.js"
+    },
+    "./autonomy-store": {
+      "types": "./src/autonomy-store.ts",
+      "default": "./lib/autonomy-store.js"
+    },
+    "./autonomy-compaction": {
+      "types": "./src/autonomy-compaction.ts",
+      "default": "./lib/autonomy-compaction.js"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "0.2.1-alpha.1"
+  }
+}

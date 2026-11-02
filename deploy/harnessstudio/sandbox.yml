@@ -1,0 +1,85 @@
+# Overlay when the Agent's Linux sandbox is on (HS_SANDBOX, gVisor runsc on the host); see docs/sandbox.md.
+# sandbox-vm-manager.yml or sandbox-none.yml then says where the task spaces are.
+#
+# sandbox-manager starts one container per conversation through the host's Docker socket and is reachable only on
+# Studio's network. Sandboxes run with runsc on an internal network whose only way out is sandbox-egress, a proxy that
+# refuses the LAN, this host and private addresses. The network's bridge has no host address (inhibit_ipv4): an
+# internal network alone still lets containers reach services listening on the host, such as vm_manager.
+# Each instance on a host needs its own network name and subnet; sandbox-manager manages only sandboxes on its network.
+services:
+  studio:
+    environment:
+      STUDIO_SANDBOX_URL: http://sandbox-manager:8100
+      STUDIO_SANDBOX_TOKEN_FILE: /run/secrets/sandbox_token
+    secrets: [mock_seat_token, provider_env, sandbox_token]
+  sandbox-manager:
+    image: harnessstudio/sandbox-manager:${HS_SANDBOX_TAG:?}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    # Compose mounts the secret file as is (the deploy user's, mode 600); holding the Docker socket is root on the
+    # host anyway, so reading it adds nothing.
+    cap_add: [DAC_READ_SEARCH]
+    networks: [studio]
+    expose: ['8100']
+    secrets: [sandbox_token]
+    environment:
+      SANDBOX_TOKEN_FILE: /run/secrets/sandbox_token
+      SANDBOX_IMAGE: harnessstudio/sandbox:${HS_SANDBOX_TAG}
+      SANDBOX_RUNTIME: runsc
+      SANDBOX_NETWORK: ${HS_SANDBOX_NETWORK:?}
+      SANDBOX_PROXY: http://${HS_SANDBOX_PROXY_IP:?}:3128
+      # Ceilings of what users can choose on the settings page.
+      SANDBOX_MAX_CPUS: '4'
+      SANDBOX_MAX_MEMORY_GB: '8'
+      SANDBOX_MAX_RUNNING: '8'
+      # Studio's data volume: its studio/skills and studio/plugins are mounted read-only at /skills and /plugins.
+      SANDBOX_STUDIO_VOLUME: ${HS_INSTANCE:?}_studio-data
+      SANDBOX_STUDIO_SUBPATH: studio
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+  sandbox-egress:
+    image: harnessstudio/sandbox-egress:${HS_SANDBOX_TAG}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /run/squid:mode=1777,size=1m
+      - /var/spool/squid:mode=1777,size=16m
+      - /var/log/squid:mode=1777,size=16m
+      - /var/cache/squid:mode=1777,size=16m
+      - /tmp:mode=1777,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    networks:
+      sandbox:
+        ipv4_address: ${HS_SANDBOX_PROXY_IP}
+      sandbox-egress: {}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+secrets:
+  sandbox_token:
+    file: ${HS_SECRETS_DIR:?}/sandbox-token
+networks:
+  sandbox:
+    name: ${HS_SANDBOX_NETWORK}
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.inhibit_ipv4: 'true'
+    ipam:
+      config:
+        - subnet: ${HS_SANDBOX_SUBNET:?}
+          ip_range: ${HS_SANDBOX_IP_RANGE:?}
+  sandbox-egress: {}

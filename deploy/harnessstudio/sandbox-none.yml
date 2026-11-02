@@ -1,0 +1,16 @@
+# Without vm_manager and with the sandbox: task spaces are in Studio's own data volume (<studio home>/studio/files).
+# sandbox-manager sees that volume read-only and mounts the granted folders into sandboxes as volume subpaths, so no
+# host folder is needed. Nothing of vm_manager is mounted.
+services:
+  sandbox-manager:
+    environment:
+      SANDBOX_PROJECTS_ROOT: /var/lib/harnessstudio/studio/files
+      SANDBOX_FILES_VOLUME: ${HS_INSTANCE:?}_studio-data
+      SANDBOX_FILES_VOLUME_ROOT: /var/lib/harnessstudio
+    volumes:
+      - type: volume
+        source: studio-data
+        target: /var/lib/harnessstudio
+        read_only: true
+        volume:
+          nocopy: true

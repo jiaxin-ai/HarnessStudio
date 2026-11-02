@@ -1,0 +1,33 @@
+# Overlay: use the host's vm_manager as Studio's software platform instead of the
+# Mock Seat. STUDIO_VMM_URL is the exact vm_manager origin reachable from the
+# Studio container (for example http://<server address>:8000, never 127.0.0.1); it is the only
+# plain-HTTP origin this overlay trusts for vm_manager. STUDIO_VMM_PROJECTS_ROOT is the projects
+# folder under vm_manager's data directory. Both are required and come from the environment.
+# Mock Seat keeps running unchanged.
+#
+# Task files become vm_manager task spaces (D:) and project files its shared
+# folder (F:). The projects directory is mounted at the same path as on the host,
+# so vm_manager's paths are valid inside Studio. Files there are written by root
+# (vm_manager and the VMs' Samba), so this overlay keeps the Studio service as
+# root; it gets no CAP_LINUX_IMMUTABLE, so frozen task spaces stay read-only.
+#
+# To return to Mock, run the same command without this file. Files Studio created
+# in its data volume while running as root must first be given back to UID 1000
+# (see docs/vm-manager-seat.md).
+services:
+  studio:
+    image: harnessstudio/studio:vm-manager-seat
+    environment:
+      STUDIO_SEAT_BACKEND: vm-manager
+      STUDIO_VMM_URL: '${STUDIO_VMM_URL:?请设置 STUDIO_VMM_URL 为 vm_manager 的地址，例如 http://<服务器地址>:8000}'
+      STUDIO_VMM_TRUSTED_HTTP_ORIGINS: ${STUDIO_VMM_URL}
+      STUDIO_VMM_PROJECTS_ROOT: '${STUDIO_VMM_PROJECTS_ROOT:?请设置 STUDIO_VMM_PROJECTS_ROOT 为 vm_manager 数据目录下 projects 文件夹的绝对路径}'
+      # Default run limit (minutes) of new VMs; users change it per VM on the software page.
+      STUDIO_VM_RUN_MINUTES: ${STUDIO_VM_RUN_MINUTES:-120}
+      STUDIO_SERVICE_USER: root
+    volumes:
+      - type: bind
+        source: '${STUDIO_VMM_PROJECTS_ROOT:?请设置 STUDIO_VMM_PROJECTS_ROOT 为 vm_manager 数据目录下 projects 文件夹的绝对路径}'
+        target: '${STUDIO_VMM_PROJECTS_ROOT}'
+        bind:
+          create_host_path: false

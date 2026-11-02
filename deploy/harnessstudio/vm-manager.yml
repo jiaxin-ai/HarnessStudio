@@ -1,0 +1,19 @@
+# Overlay when HS_VMM_URL is set: the host's vm_manager is Studio's software platform (see docs/vm-manager-seat.md).
+# Task files live in vm_manager's projects folder, mounted at the same path as on the host. Files there belong to
+# root (vm_manager and the VMs' Samba), so Studio runs as root; it still has no CAP_LINUX_IMMUTABLE.
+services:
+  studio:
+    environment:
+      STUDIO_SEAT_BACKEND: vm-manager
+      STUDIO_VMM_URL: ${HS_VMM_URL:?}
+      STUDIO_VMM_TRUSTED_HTTP_ORIGINS: ${HS_VMM_URL}
+      STUDIO_VMM_PROJECTS_ROOT: ${HS_VMM_PROJECTS_ROOT:?}
+      # Default run limit (minutes) of new VMs; users change it per VM on the software page.
+      STUDIO_VM_RUN_MINUTES: '120'
+      STUDIO_SERVICE_USER: root
+    volumes:
+      - type: bind
+        source: ${HS_VMM_PROJECTS_ROOT}
+        target: ${HS_VMM_PROJECTS_ROOT}
+        bind:
+          create_host_path: false

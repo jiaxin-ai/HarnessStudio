@@ -1,0 +1,34 @@
+# Self-owned deployment assembly. The official CLI deliberately rejects an
+# all-interface flag; its webserver plugin supports it for custom compositions.
+- id: webserver
+  config:
+    host: !!js process.env.STUDIO_BIND_HOST || '0.0.0.0'
+    port: !!js ctx.webStartup.port ?? 3080
+- id: web-runtime
+  config:
+    openBrowser: false
+    printUrl: true
+    surfaceContext: false
+    publicUrl: !!js process.env.STUDIO_PUBLIC_URL || ctx.webStartup.publicUrl
+    trustedHosts: !!js (process.env.STUDIO_TRUSTED_HOSTS || '').split(',').map(value => value.trim()).filter(Boolean)
+- id: connection
+  config:
+    trustedHosts: !!js ctx.webRuntime.trustedHosts
+    cookieMaxAgeDays: 30
+    maxRequestBodyBytes: 33554432
+# Exact, deployment-local HTTP opt-in; all other remote Seat origins still
+# require HTTPS. A plain-HTTP vm_manager is trusted separately and only for
+# STUDIO_VMM_URL. Restate the full config because Cordis patches replace it.
+- id: studio-software-seat
+  config:
+    dataRoot: !!js dshHomePath('studio')
+    endpoint: !!js process.env.STUDIO_SEAT_URL || ''
+    token: !!js process.env.STUDIO_SEAT_TOKEN || ''
+    promptPath: !!js process.env.STUDIO_ROOT + '/prompts/software-bridge-system-prompt.md'
+    timeoutMs: 10000
+    trustedHttpOrigins: ['http://mock-seat:8080']
+    backend: !!js process.env.STUDIO_SEAT_BACKEND || 'mock'
+    vmEndpoint: !!js process.env.STUDIO_VMM_URL || ''
+    vmTrustedHttpOrigins: !!js (process.env.STUDIO_VMM_TRUSTED_HTTP_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean)
+    vmPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/software-vm-system-prompt.md'
+    vmRunMinutes: !!js Number(process.env.STUDIO_VM_RUN_MINUTES) || 120

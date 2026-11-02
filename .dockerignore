@@ -1,0 +1,46 @@
+# Deny by default. Dependencies and the pinned upstream are installed in Linux.
+**
+!Dockerfile
+!package.json
+!package-lock.json
+!tsconfig.json
+!scripts/
+!scripts/*.mjs
+!config/
+!config/package.json
+!config/*.yml
+!plugins/
+!plugins/*/
+!plugins/*/package.json
+!plugins/*/src/
+!plugins/*/src/**
+!apps/
+!apps/mock-seat/
+!apps/mock-seat/src/
+!apps/mock-seat/src/**
+!apps/sandbox-manager/
+!apps/sandbox-manager/src/
+!apps/sandbox-manager/src/**
+!prompts/
+!prompts/*.md
+!deploy/
+!deploy/container.patch.yml
+!deploy/build-inputs.json
+!deploy/sandbox/
+!deploy/sandbox/**
+# The batch client image (Dockerfile target cli): its source and lock file only.
+!cli/
+!cli/package.json
+!cli/package-lock.json
+!cli/bin/
+!cli/bin/**
+!cli/src/
+!cli/src/**
+# Defense in depth if an allowlisted directory later gains local data.
+**/node_modules/**
+**/.git/**
+**/.env*
+**/*credentials*
+**/*.pem
+**/*.key
+**/.DS_Store

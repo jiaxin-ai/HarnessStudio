@@ -1,0 +1,8 @@
+{
+  "name": "@harnessstudio/smoke",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./lib/index.js" },
+  "peerDependencies": { "@deepseek-ai/dsh": "0.2.1-alpha.1" }
+}

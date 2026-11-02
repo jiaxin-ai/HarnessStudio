@@ -1,0 +1,72 @@
+name: harnessstudio
+x-service: &service
+  init: true
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  # Bootstrap prepares mounts and drops UID. KILL lets root init forward signals
+  # to that UID; setuid clears capabilities in the service process itself.
+  cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+  networks: [studio]
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: '3'
+services:
+  mock-seat:
+    <<: *service
+    image: harnessstudio/mock-seat:m6
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: mock-seat
+    environment:
+      STUDIO_MOCK_SEAT_TOKEN_FILE: /run/secrets/mock_seat_token
+    secrets: [mock_seat_token]
+    volumes:
+      - mock-data:/var/lib/mock-seat
+    # No host port. Only Studio and this Compose network can reach the platform.
+    expose: ['8080']
+  studio:
+    <<: *service
+    image: harnessstudio/studio:m6
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: studio
+    depends_on:
+      mock-seat:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:${STUDIO_PUBLISHED_PORT:-3080}:3080'
+    environment:
+      STUDIO_SEAT_URL: http://mock-seat:8080
+      STUDIO_SEAT_TOKEN_FILE: /run/secrets/mock_seat_token
+      STUDIO_PROVIDER_ENV_FILE: /run/secrets/provider_env
+      STUDIO_PUBLIC_URL: ${STUDIO_PUBLIC_URL:-http://127.0.0.1:${STUDIO_PUBLISHED_PORT:-3080}/}
+      STUDIO_TRUSTED_HOSTS: ${STUDIO_TRUSTED_HOSTS:-}
+      # Software platform: mock (default) or vm-manager. A plain-HTTP vm_manager
+      # origin must also be listed exactly in STUDIO_VMM_TRUSTED_HTTP_ORIGINS.
+      STUDIO_SEAT_BACKEND: ${STUDIO_SEAT_BACKEND:-mock}
+      STUDIO_VMM_URL: ${STUDIO_VMM_URL:-}
+      STUDIO_VMM_TRUSTED_HTTP_ORIGINS: ${STUDIO_VMM_TRUSTED_HTTP_ORIGINS:-}
+      NO_PROXY: ${STUDIO_NO_PROXY:-localhost,127.0.0.1,::1,mock-seat}
+    secrets: [mock_seat_token, provider_env]
+    volumes:
+      - studio-data:/var/lib/harnessstudio
+secrets:
+  mock_seat_token:
+    file: ${STUDIO_DEPLOY_SECRETS_DIR:-../.studio/deploy/secrets}/mock-seat-token
+  provider_env:
+    file: ${STUDIO_DEPLOY_SECRETS_DIR:-../.studio/deploy/secrets}/provider.env
+volumes:
+  studio-data:
+  mock-data:
+networks:
+  studio:

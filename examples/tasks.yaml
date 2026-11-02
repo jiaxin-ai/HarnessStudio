@@ -1,0 +1,48 @@
+# harnessstudio run 的任务清单示例。运行：
+#   harnessstudio run examples/tasks.yaml
+# 每个任务在 Studio 里建成一个项目，按自主模式跑完；结果在 ./harnessstudio-runs/<时间>/ 下。
+# 字段写错（比如 budjet）会报错并列出全部问题，一个任务都不会启动。
+
+defaults:                         # 对每个任务都生效；任务里写了同名字段就以任务为准
+  orchestratorModel: deepseek-v4-pro   # 总 Agent 的模型：Studio「模型配置」里的模型名；
+                                       #   多个 provider 有同名模型时写成 provider/模型名
+  workerModel: deepseek-v4-flash       # 子 Agent 的默认模型；不写就和总 Agent 相同
+  workerModels: []                     # 可选：总 Agent 可以给个别任务换用的模型（例如操作虚拟机要能看图的模型）
+  budget:                              # 可选：没写的项用 Studio「模型配置 → 自主模式默认值」
+    tokens: 3000000                    #   折算 token 上限（缓存读取按系数打折后计入）
+    hours: 1                           #   运行时长上限（小时）
+    # vms: 1                           #   同时开的虚拟机（没接 vm_manager 时不起作用）
+    # workers: 3                       #   同时工作的子 Agent
+    # rounds: 200                      #   总 Agent 的轮数上限
+    # cacheReadWeight: 0.1             #   缓存读取的折算系数（0–1）
+  parallel: 1                          # 同时跑几个任务；命令行 --parallel 优先
+  projectPrefix: "批量示例"            # 项目名前缀：项目名是「前缀 月-日 时:分 · 任务名」
+
+tasks:
+  - name: 齿轮校核简报                  # 任务名：清单内唯一，也用作输出子文件夹名
+    goal: |                             # 目标：写清楚要做成什么、交付什么，像交代给同事一样
+      为一对标准直齿圆柱齿轮写一份强度校核简报（Markdown）：
+      模数 3 mm，小齿轮 20 齿、大齿轮 60 齿，齿宽 40 mm，传递功率 7.5 kW，小齿轮转速 1450 r/min，
+      材料 40Cr 调质。按 GB/T 3480 的思路估算齿面接触应力和齿根弯曲应力，给出安全系数和结论。
+      计算过程用 Python 在沙箱里做，脚本和简报都作为任务文件提交。缺少的系数按常用取值并写明假设。
+
+  - name: 轴承寿命计算
+    goal: |
+      项目共享盘里的「轴承工况.csv」列出了几种工况下深沟球轴承 6208 的径向载荷、轴向载荷和转速。
+      查出 6208 的基本额定动载荷和静载荷，按 ISO 281 计算每种工况的当量动载荷和 L10 寿命（小时），
+      汇总成一张表（CSV）和一页说明（Markdown），指出寿命最短的工况和改进建议。
+    files: [./inputs/轴承工况.csv]       # 可选：相对清单所在目录；上传到这个项目的共享盘（虚拟机里是 F:）根目录
+    budget: { hours: 0.5 }               # 可选：只覆盖这一项，其余沿用 defaults
+
+  - name: 法兰盘二维图
+    goal: |
+      画一张 DN100 PN16 平焊法兰的二维图纸，保存为 DXF：外径 220 mm、螺栓孔中心圆 180 mm、
+      8 个 φ18 螺栓孔、内孔 φ110，标注主要尺寸。在沙箱里用 Python（ezdxf）生成，
+      再把图纸渲染成 PNG 自己检查一遍，DXF、PNG 和脚本都提交。
+
+  # 要用工程软件的任务（需要接好 vm_manager）大致这样写：
+  # - name: RC 低通滤波仿真
+  #   goal: |
+  #     用 LTspice 仿真 R=1 kΩ、C=100 nF 的一阶 RC 低通滤波器，求 -3 dB 截止频率并和理论值比较……
+  #   workerModel: deepseek-flash        # 操作虚拟机要能看图的模型
+  #   budget: { vms: 1, hours: 2 }       # 用虚拟机的任务受主机资源限制，同时最多约 2 个

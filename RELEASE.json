@@ -1,0 +1,37 @@
+{
+  "formatVersion": 1,
+  "product": "HarnessStudio",
+  "version": "0cc036ec4e22",
+  "productVersion": "0.1.0",
+  "generatedAt": "2026-11-02T08:55:18.751Z",
+  "source": {
+    "commit": "d2e9d68309eb4973709dcc0cf7d3b8d18ef71010",
+    "dirty": false
+  },
+  "buildInputs": {
+    "nodeImage": "node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20",
+    "nodeVersion": "24.21.0",
+    "pnpmVersion": "11.7.0",
+    "upstreamRepository": "https://github.com/deepseek-ai/deepseek-harness.git",
+    "upstreamCommit": "5badb15009ae1756c3afe0ae0cef1faafc290ccc",
+    "upstreamBuild": "build:official",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ]
+  },
+  "incomplete": [],
+  "guides": [
+    "Agent看图使用说明.md",
+    "MCP工具使用说明.md",
+    "后台运行使用说明.md",
+    "技能使用说明.md",
+    "插件使用说明.md",
+    "无软件模式使用说明.md",
+    "沙箱使用说明.md",
+    "自主模式使用说明.md",
+    "部署与批量任务使用说明.md",
+    "项目导出使用说明.md"
+  ],
+  "localReferences": []
+}

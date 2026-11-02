@@ -1,0 +1,21 @@
+# Explicit fixtures for the historical M1 normal-provider test only.
+# A normal installation starts with no synthetic project or tasks.
+- id: studio
+  config:
+    dataRoot: !!js dshHomePath('studio')
+    promptPath: !!js process.env.STUDIO_ROOT + '/prompts/engineering-system-prompt.md'
+    projectPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/project-system-prompt.md'
+    projectLiveContextPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/project-live-context-system-prompt.md'
+    taskLiveContextSingleUserPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/task-live-context-single-user-system-prompt.md'
+    taskLiveContextReviewedPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/task-live-context-reviewed-system-prompt.md'
+    projectChatTempPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/project-chat-temp-system-prompt.md'
+    taskChatTempPromptPath: !!js process.env.STUDIO_ROOT + '/prompts/task-chat-temp-system-prompt.md'
+    pdfRendererPath: !!js process.env.STUDIO_PDF_RENDERER_PATH || 'pdftoppm'
+    workspaceIds: [m1-gear, m1-bearing]
+    maxFileBytes: 262144
+- id: studio-domain
+  config:
+    dataRoot: !!js dshHomePath('studio')
+    workflowMode: !!js process.env.STUDIO_WORKFLOW_MODE || 'single-user'
+    legacyWorkspaceIds: [m1-gear, m1-bearing]
+    maxFileBytes: 262144
